@@ -84,6 +84,8 @@ A web application that extracts YouTube transcripts and enriches them with visua
 
 ## 3. Architecture Overview
 
+### 3.1. Full-stack Birds-eye View
+
 ```
 +-----------------------------------------------------------------------+
 |                           CLIENT (Browser)                            |
@@ -135,6 +137,10 @@ A web application that extracts YouTube transcripts and enriches them with visua
 | (via yt-dlp)     |    | - Gemini API     |    | - Admin identity     |
 |                  |    | - OAuth          |    | - Network-level ACL  |
 +------------------+    +------------------+    +----------------------+
+```
+
+### 3.2. Front-end Component Strategy
+```
 ```
 
 ---
@@ -237,7 +243,7 @@ interface AnonymousSession {
 |   |                                                               |   |
 |   |   +-------------------------+  +---------------------------+  |   |
 |   |   |                         |  |                           |  |   |
-|   |   |   [*] Create Passkey   |  |   [G] Continue with       |  |   |
+|   |   |   [*] Create Passkey   |  |   [G] Continue with        |  |   |
 |   |   |       (Recommended)     |  |       Google              |  |   |
 |   |   |                         |  |                           |  |   |
 |   |   +-------------------------+  +---------------------------+  |   |
@@ -497,7 +503,7 @@ https://www.googleapis.com/auth/youtube.readonly  (optional)
 |                              |      Hanko       |                     |
 |                              |                  |                     |
 |                              |  BLOCKS:         |                     |
-|                              |  /admin/* --> 404|<-- Not exposed     |
+|                              |  /admin/* --> 404|<-- Not exposed      |
 |                              +------------------+    to public        |
 |                                                                       |
 +-----------------------------------------------------------------------+
@@ -811,12 +817,12 @@ const handleDeleteMoment = async (momentId: string) => {
 |  Transcript                    [Q]  |
 |  -----------------------------------+
 |                                     |
-|  | 0:00  Welcome to today's...     |
-|  |                                 |  <-- Scrollable
-|  | 0:15  As you can see here... *  |  <-- * = moment marker
-|  |                                 |
-|  | 0:32  The diagram shows...  *   |
-|  |                                 |
+|  | 0:00  Welcome to today's...      |
+|  |                                  |  <-- Scrollable
+|  | 0:15  As you can see here... *   |  <-- * = moment marker
+|  |                                  |
+|  | 0:32  The diagram shows...  *    |
+|  |                                  |
 |                                     |
 |                            ( + )    |  <-- FAB for adding moments
 |                                     |
@@ -837,19 +843,19 @@ const handleDeleteMoment = async (momentId: string) => {
 **Landscape Mode (Immersive Player):**
 
 ```
-+-----------------------------------------------------------------------+
-|                                                                       |
-|                                                                       |
-|                    Video Preview (Full Width)                         |
-|                                                                       |
-|                                                                       |
-+-----------------------------------------------------------------------+
-| ....####......######....########....#..........###########.........* |
-| ^                                                                   ^ |
-| Tap anywhere to seek                           Tap * to jump to moment|
-|                                                                       |
-| [Exit]                                        [Mark Moment] (large)   |
-+-----------------------------------------------------------------------+
++------------------------------------------------------------------------+
+|                                                                        |
+|                                                                        |
+|                    Video Preview (Full Width)                          |
+|                                                                        |
+|                                                                        |
++------------------------------------------------------------------------+
+| ....####......######....########....#..........###########.........*   |
+| ^                                                                  ^   |
+| Tap anywhere to seek                           Tap * to jump to moment |
+|                                                                        |
+| [Exit]                                        [Mark Moment] (large)    |
++------------------------------------------------------------------------+
 ```
 
 ---
@@ -885,7 +891,7 @@ The **Moments Universe** is not just a feature -- it's the soul of the applicati
 |   |     /          \        |                      |              |   |
 |   |    @            @       o                      @              |   |
 |   |   0:15         0:45    5:20                  32:10            |   |
-|   |  (locked)     (locked) (pending)            (auto)           |   |
+|   |  (locked)     (locked) (pending)            (auto)            |   |
 |   |                                                               |   |
 |   +===============================================================+   |
 |                                                                       |
@@ -1027,26 +1033,26 @@ When user activates moment picking:
 After moments are confirmed and frames extracted:
 
 ```
-+-----------------------------------------------------------------------+
-|                                                                       |
-|   Your Moments (5)                               [Upload All] [Export]|
-|                                                                       |
-|   +---------------------------------------------------------------+   |
-|   |                                                               |   |
-|   |    +--------+    +--------+    +--------+    +--------+       |   |
-|   |    |        |    |        |    |        |    |        |       |   |
-|   |    | [IMG]  |    | [IMG]  |    | [IMG]  |    | [IMG]  |       |   |
-|   |    |        |    |        |    |        |    |        |       |   |
-|   |    |  0:15  |    |  0:45  |    |  5:20  |    | 32:10  |       |   |
-|   |    | Ready  |    | Ready  |    | Upload |    | Ready  |       |   |
-|   |    |        |    |        |    |        |    |        |       |   |
-|   |    +--------+    +--------+    +--------+    +--------+       |   |
-|   |         ^             ^             ^             ^           |   |
-|   |    Drag to reorder                                            |   |
-|   |                                                               |   |
-|   +---------------------------------------------------------------+   |
-|                                                                       |
-+-----------------------------------------------------------------------+
++------------------------------------------------------------------------+
+|                                                                        |
+|   Your Moments (5)                               [Upload All] [Export] |
+|                                                                        |
+|   +---------------------------------------------------------------+    |
+|   |                                                               |    |
+|   |    +--------+    +--------+    +--------+    +--------+       |    |
+|   |    |        |    |        |    |        |    |        |       |    |
+|   |    | [IMG]  |    | [IMG]  |    | [IMG]  |    | [IMG]  |       |    |
+|   |    |        |    |        |    |        |    |        |       |    |
+|   |    |  0:15  |    |  0:45  |    |  5:20  |    | 32:10  |       |    |
+|   |    | Ready  |    | Ready  |    | Upload |    | Ready  |       |    |
+|   |    |        |    |        |    |        |    |        |       |    |
+|   |    +--------+    +--------+    +--------+    +--------+       |    |
+|   |         ^             ^             ^             ^           |    |
+|   |    Drag to reorder                                            |    |
+|   |                                                               |    |
+|   +---------------------------------------------------------------+    |
+|                                                                        |
++------------------------------------------------------------------------+
 ```
 
 **Interactions:**
@@ -1246,7 +1252,7 @@ class RuleBasedMoment:
 |              |                         |                              |
 |              v No                      v Yes                          |
 |   +---------------------+   +-------------------------------------+   |
-|   | Trigger OAuth flow  |   | Call Gemini API with user's token  |   |
+|   | Trigger OAuth flow  |   | Call Gemini API with user's token   |   |
 |   | (via our app)       |   |                                     |   |
 |   +---------------------+   +-------------------------------------+   |
 |                                         |                             |
@@ -1825,6 +1831,20 @@ class CacheManager:
         # Implementation would update DB or file metadata
         pass
 ```
+
+**Step-by-step UX for seeking to uncached regions:**
+
+1. User seeks to uncached region
+2. Timeline shows "loading" animation for that segment
+3. Video displays "Loading preview..." placeholder
+4. Segment downloads (2-4 seconds for 30s @ 360p)
+5. Video begins playing from requested timestamp
+6. Adjacent segments prefetch in background
+
+**Notes on gapless playback (nice-to-have):**
+- Preload next segment's first few seconds into buffer
+- Use MediaSource API for seamless switching
+- Fall back to brief loading indicator if segment not ready
 
 ### 9.3 Session Lifecycle
 
@@ -2481,11 +2501,11 @@ CREATE TABLE admin_audit_log (
 
 ## Visual Moments Index
 
-| Timestamp | Description | Type |
-|-----------|-------------|------|
-| 00:15 | Code editor showing HTML structure | code |
-| 00:45 | Flexbox diagram explaining axis distribution | diagram |
-| 02:30 | Browser DevTools demonstration | ui |
+| Timestamp | Description                                   | Type    |
+|:---------:|:----------------------------------------------|:-------:|
+|  00:15    | Code editor showing HTML structure            |  code   |
+|  00:45    | Flexbox diagram explaining axis distribution  | diagram |
+|  02:30    | Browser DevTools demonstration                |   ui    |
 
 ---
 
@@ -2581,10 +2601,10 @@ No login required -- if you can reach it, you're authorized (Tailscale identity)
 +-----------------------------------------------------------------------+
 |                                                                       |
 |  System Health                                                        |
-|  +------------------+  +------------------+  +------------------+      |
+|  +------------------+  +------------------+  +------------------+     |
 |  |  CPU: 23%        |  |  RAM: 1.8/8 GB   |  |  Cache: 4.2 GB   |     |
 |  |  ####......      |  |  ######....      |  |  ########..      |     |
-|  +------------------+  +------------------+  +------------------+      |
+|  +------------------+  +------------------+  +------------------+     |
 |                                                                       |
 |  Active Sessions: 3     Queue Depth: 2      Gemini Calls Today: 47    |
 |                                                                       |
@@ -2603,7 +2623,7 @@ No login required -- if you can reach it, you're authorized (Tailscale identity)
 
 ```
 +-----------------------------------------------------------------------+
-|  Users                                           [Search] [Export CSV] |
+|  Users                                          [Search] [Export CSV] |
 +-----------------------------------------------------------------------+
 |                                                                       |
 |  ID         | Type       | Google | Local LLM | Videos | Last Active  |
@@ -2621,7 +2641,7 @@ No login required -- if you can reach it, you're authorized (Tailscale identity)
 
 ```
 +-----------------------------------------------------------------------+
-|  User: user_abc                                              [<- Back] |
+|  User: user_abc                                             [<- Back] |
 +-----------------------------------------------------------------------+
 |                                                                       |
 |  Account Details                                                      |
@@ -2651,16 +2671,16 @@ No login required -- if you can reach it, you're authorized (Tailscale identity)
 |  Cache Status                                                         |
 +-----------------------------------------------------------------------+
 |                                                                       |
-|  Total Size: 4.2 GB / 10 GB                                          |
+|  Total Size: 4.2 GB / 10 GB                                           |
 |  ####################....................                             |
 |                                                                       |
-|  Segments: 234 files (3.8 GB)                                        |
-|  Frames: 1,203 files (0.3 GB)                                        |
-|  Metadata: 89 files (0.1 GB)                                         |
+|  Segments: 234 files (3.8 GB)                                         |
+|  Frames: 1,203 files (0.3 GB)                                         |
+|  Metadata: 89 files (0.1 GB)                                          |
 |                                                                       |
-|  Currently Locked: 12 segments (3 sessions)                          |
+|  Currently Locked: 12 segments (3 sessions)                           |
 |                                                                       |
-|  [Clear Unlocked Segments]  [Clear All Frames]  [Clear Everything]   |
+|  [Clear Unlocked Segments]  [Clear All Frames]  [Clear Everything]    |
 |                                                                       |
 +-----------------------------------------------------------------------+
 ```
@@ -2671,6 +2691,7 @@ No login required -- if you can reach it, you're authorized (Tailscale identity)
 
 ### 15.1 Framework Stack
 
+**Building blocks:**
 ```
 shadcn/ui (foundation)
         |
@@ -2682,6 +2703,24 @@ Aceternity UI / Magic UI (hero effects)
         |
         v
 React Three Fiber (background shaders) -- optional
+```
+
+**Component strategy:**
+```
++----------------------------------+------------------------+-----------------------------+
+| Component Need                   | Solution               | Source                      |
++----------------------------------+------------------------+-----------------------------+
+| Forms, buttons, dialogs, inputs  | shadcn/ui              | Standard, accessible        |
+| Transcript list (virtual scroll) | shadcn + custom        | @tanstack/react-virtual     |
+| Video segment player             | Custom build           | No OOTB option              |
+| Timeline with segment indicators | Custom build           | Unique requirement          |
+| Frame review gallery             | shadcn/ui + Framer     | Lightbox with gestures      |
+| Loading states, skeletons        | shadcn/ui              | Standard                    |
+| Toasts, notifications            | sonner                 | shadcn default              |
+| Hero animations                  | Aceternity UI          | Pre-built wow effects       |
+| Micro-interactions               | Framer Motion          | Entrance/exit animations    |
+| Background effects               | Three.js or CSS        | Optional shader             |
++----------------------------------+------------------------+-----------------------------+
 ```
 
 ### 15.2 Key "Wow" Moments
@@ -2719,15 +2758,45 @@ React Three Fiber (background shaders) -- optional
 **Golden Rule:** One "hero" effect per view. Don't stack multiple expensive animations.
 
 ```
-+----------------------+------------------+--------------------------------+
-| Effect               | Performance Cost | Mitigation                     |
-+----------------------+------------------+--------------------------------+
++----------------------+------------------+---------------------------------+
+| Effect               | Performance Cost | Mitigation                      |
++----------------------+------------------+---------------------------------+
 | Three.js background  | Medium (GPU)     | Simple shader, pause when hidden|
-| Framer Motion        | Low              | Use layout prop wisely         |
-| Aceternity effects   | Varies           | Pick lightweight ones          |
+| Framer Motion        | Low              | Use layout prop wisely          |
+| Aceternity effects   | Varies           | Pick lightweight ones           |
 | Particle effects     | Medium-High      | Limit count, use CSS if possible|
-| Lottie               | Low              | Pre-optimized vectors          |
-+----------------------+------------------+--------------------------------+
+| Lottie               | Low              | Pre-optimized vectors           |
++----------------------+------------------+---------------------------------+
+```
+
+### 15.5 `shadcn` Extensibility Assessment
+
+**Strengths:**
+- Headless architecture (you own the code, not node_modules)
+- Tailwind-based, easy to modify
+- Accessible by default (Radix primitives)
+- Great starting point for custom components
+
+**Gaps for This Project:**
+- No video player component (expected—this is specialized)
+- No timeline/range-with-markers component (we'll build it)
+- No virtualized list (use @tanstack/react-virtual)
+
+**Verdict:** shadcn is the right foundation. The gaps are specific to our unique features and would exist with any general-purpose UI library.
+
+
+### 15.6 Cool Libraries
+```
++--------------------+---------------------------------------------+--------------------------------+
+| Library            | What It Does                                | Use Case in Our App            |
++--------------------+---------------------------------------------+--------------------------------+
+| Aceternity UI      | Animated components (cards, backgrounds)    | Hero section, card hovers      |
+| Magic UI           | Animated gradients, text shimmer, borders   | Text effects, borders          |
+| Framer Motion      | Production animation library                | Transitions, reordering        |
+| React Three Fiber  | React renderer for Three.js                 | Background shader (optional)   |
+| Lottie             | After Effects animations in web             | Success/error state animations |
+| GSAP               | Professional animation (complex timelines)  | Scroll-triggered sequences     |
++--------------------+---------------------------------------------+--------------------------------+
 ```
 
 ---
@@ -2737,9 +2806,9 @@ React Three Fiber (background shaders) -- optional
 ### 16.1 Process Layout
 
 ```
-+-----------------------------------------------------------------------+
-|                         Hostinger KVM 4                               |
-|                                                                       |
++----------------------------------------------------------------------+
+|                         Hostinger KVM 4                              |
+|                                                                      |
 |  +----------------------------------------------------------------+  |
 |  |  Caddy (Reverse Proxy)                                         |  |
 |  |  - TLS termination (public)                                    |  |
@@ -2748,23 +2817,23 @@ React Three Fiber (background shaders) -- optional
 |  |  - Route /* --> Next.js :3000                                  |  |
 |  |  - Tailscale listener :8443 for /admin/*                       |  |
 |  +----------------------------------------------------------------+  |
-|                              |                                        |
-|         +--------------------+--------------------+                   |
-|         v                    v                    v                   |
-|  +-------------+      +-------------+      +-------------+            |
+|                              |                                       |
+|         +--------------------+--------------------+                  |
+|         v                    v                    v                  |
+|  +-------------+      +-------------+      +-------------+           |
 |  |  Next.js    |      |  FastAPI    |      |  Hanko      |           |
 |  |  :3000      |      |  :8000      |      |  :8001      |           |
 |  |  (2 workers)|      |  (2 workers)|      |  (1 worker) |           |
-|  +-------------+      +-------------+      +-------------+            |
-|                              |                                        |
-|              +---------------+---------------+                        |
-|              v                               v                        |
-|       +-------------+                 +-------------+                 |
-|       |  Huey       |                 |  Ollama     |                 |
-|       |  Worker     |                 |  :11434     |                 |
-|       |  (1 process)|                 |  (on-demand)|                 |
-|       +-------------+                 +-------------+                 |
-|                                                                       |
+|  +-------------+      +-------------+      +-------------+           |
+|                              |                                       |
+|              +---------------+---------------+                       |
+|              v                               v                       |
+|       +-------------+                 +-------------+                |
+|       |  Huey       |                 |  Ollama     |                |
+|       |  Worker     |                 |  :11434     |                |
+|       |  (1 process)|                 |  (on-demand)|                |
+|       +-------------+                 +-------------+                |
+|                                                                      |
 |  +----------------------------------------------------------------+  |
 |  |  Persistent Storage                                            |  |
 |  |  /var/lib/yttool/                                              |  |
@@ -2772,13 +2841,13 @@ React Three Fiber (background shaders) -- optional
 |  |  |-- tasks.db         (Huey task queue)                        |  |
 |  |  '-- cache/           (Video segments, frames)                 |  |
 |  +----------------------------------------------------------------+  |
-|                                                                       |
+|                                                                      |
 |  +----------------------------------------------------------------+  |
 |  |  PostgreSQL (for Hanko only)                                   |  |
 |  |  /var/lib/postgresql/data                                      |  |
 |  +----------------------------------------------------------------+  |
-|                                                                       |
-+-----------------------------------------------------------------------+
+|                                                                      |
++----------------------------------------------------------------------+
 ```
 
 ### 16.2 systemd Service Units
@@ -3099,6 +3168,13 @@ ollama pull qwen2.5:1.5b-instruct-q4_K_M
 |         |            | Google OAuth flows, ASCII-safe diagrams, restored      |
 |         |            | cache/process/data model sections from v1, added       |
 |         |            | systemd configs, expanded API spec, added dependencies |
++---------+------------+--------------------------------------------------------+
+| 3.1     | 2024-12-14 | Not really finalized. Opus got straight ass after the  |
+|         |            | second iteration or so, added stuff that's completely  |
+|         |            | irrelevant (systemd resource files) and just got lazy  |
+|         |            | about others (details lost between v1 and v2).         |
+|         |            |                                                        |
+|         |            |                                                        |
 +---------+------------+--------------------------------------------------------+
 ```
 
