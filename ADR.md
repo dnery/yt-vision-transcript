@@ -84,8 +84,6 @@ A web application that extracts YouTube transcripts and enriches them with visua
 
 ## 3. Architecture Overview
 
-### 3.1. Full-stack Birds-eye View
-
 ```
 +-----------------------------------------------------------------------+
 |                           CLIENT (Browser)                            |
@@ -137,10 +135,6 @@ A web application that extracts YouTube transcripts and enriches them with visua
 | (via yt-dlp)     |    | - Gemini API     |    | - Admin identity     |
 |                  |    | - OAuth          |    | - Network-level ACL  |
 +------------------+    +------------------+    +----------------------+
-```
-
-### 3.2. Front-end Component Strategy
-```
 ```
 
 ---
