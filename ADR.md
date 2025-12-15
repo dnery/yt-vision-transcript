@@ -1,8 +1,8 @@
 # ADR-001: YouTube Transcript Extraction Tool Architecture
 
 **Status:** Proposed  
-**Version:** 3.0 (Final Draft)  
-**Date:** 2024-12-14  
+**Version:** 4.0  
+**Date:** 2024-12-15  
 **Decision Makers:** Project Owner  
 **Context:** Personal project, learning-focused, resource-constrained hosting
 
@@ -14,23 +14,26 @@
 2. [System Context & Constraints](#2-system-context--constraints)
 3. [Architecture Overview](#3-architecture-overview)
 4. [Authentication & Identity Architecture](#4-authentication--identity-architecture)
-5. [Mobile-First Accessibility Design](#5-mobile-first-accessibility-design)
-6. [The Moments Universe (Core Feature)](#6-the-moments-universe-core-feature)
-7. [Moment Detection Engine (3-Tier System)](#7-moment-detection-engine-3-tier-system)
-8. [Video Segment Strategy](#8-video-segment-strategy)
-9. [Cache Architecture & Session Locking](#9-cache-architecture--session-locking)
-10. [Process Management & Concurrency Control](#10-process-management--concurrency-control)
-11. [Data Models](#11-data-models)
-12. [API Specification](#12-api-specification)
-13. [Export Artifact Format](#13-export-artifact-format)
-14. [Admin Dashboard](#14-admin-dashboard)
-15. [Visual Polish & Cool Factor](#15-visual-polish--cool-factor)
-16. [Deployment Architecture](#16-deployment-architecture)
-17. [Implementation Phases](#17-implementation-phases)
-18. [Risk Assessment](#18-risk-assessment)
-19. [Open Questions](#19-open-questions)
-20. [Appendix: Dependencies](#20-appendix-dependencies)
-21. [Revision History](#21-revision-history)
+5. [Session Management](#5-session-management)
+6. [Rate Limiting & Quotas](#6-rate-limiting--quotas)
+7. [Mobile-First Accessibility Design](#7-mobile-first-accessibility-design)
+8. [The Moments Universe (Core Feature)](#8-the-moments-universe-core-feature)
+9. [Moment Detection Engine (2-Tier System)](#9-moment-detection-engine-2-tier-system)
+10. [Video Segment Strategy](#10-video-segment-strategy)
+11. [Cache Architecture](#11-cache-architecture)
+12. [Process Management & Concurrency Control](#12-process-management--concurrency-control)
+13. [Data Models](#13-data-models)
+14. [API Specification](#14-api-specification)
+15. [Export Artifact Format](#15-export-artifact-format)
+16. [Admin Dashboard](#16-admin-dashboard)
+17. [Visual Polish & Cool Factor](#17-visual-polish--cool-factor)
+18. [Deployment Architecture](#18-deployment-architecture)
+19. [Implementation Phases](#19-implementation-phases)
+20. [Risk Assessment](#20-risk-assessment)
+21. [Open Questions](#21-open-questions)
+22. [Appendix A: Dependencies](#appendix-a-dependencies)
+23. [Appendix B: Environment Variables](#appendix-b-environment-variables)
+24. [Revision History](#revision-history)
 
 ---
 
@@ -61,17 +64,45 @@ A web application that extracts YouTube transcripts and enriches them with visua
 
 **Key Implication:** Every architectural decision must be evaluated against "can this run as a background service without starving other workloads?"
 
-### 2.2 Functional Requirements
+### 2.2 Memory Budget
+
+The 2 GB ceiling must accommodate all project components. Here is the expected memory footprint:
+
+```
++---------------------------+-------------+--------------------------------+
+| Component                 | Memory      | Notes                          |
++---------------------------+-------------+--------------------------------+
+| FastAPI (2 workers)       | ~200 MB     | ~100 MB per uvicorn worker     |
+| Next.js (production)      | ~150 MB     | Single Node.js process         |
+| Hanko                     | ~100 MB     | Lightweight Go binary          |
+| PostgreSQL (Hanko only)   | ~200 MB     | Small dataset, shared_buffers  |
+| Huey worker (1 process)   | ~100 MB     | Python process with task queue |
+| Ollama (idle)             | ~50 MB      | Process overhead when idle     |
+| Ollama + Qwen2.5-1.5B     | ~1.8 GB     | Only when running inference    |
++---------------------------+-------------+--------------------------------+
+| TOTAL (LLM idle)          | ~800 MB     | Normal operation               |
+| TOTAL (LLM active)        | ~2.5 GB     | Temporarily exceeds ceiling    |
++---------------------------+-------------+--------------------------------+
+```
+
+**Mitigation for LLM peak usage:**
+- Ollama loads model on-demand and unloads after idle timeout (default 5 min)
+- Configure `OLLAMA_KEEP_ALIVE=2m` to reduce idle memory hold
+- Local LLM is admin-gated; most users never trigger this path
+- System swap file (2 GB) provides safety margin for brief spikes
+
+### 2.3 Functional Requirements
 
 1. Extract title, description, and timestamped transcript from YouTube URLs
-2. **The Moments Universe:** A core, beautiful experience for identifying visual moments
-3. Preview video segments without downloading entire videos
-4. Three-tier moment detection: Rules -> Cloud LLM -> Local LLM
-5. Extract frames at selected timestamps
-6. Upload frames to external image hosting
-7. Generate final AI-consumable artifact with embedded images
+2. Support transcript language selection when multiple tracks available
+3. **The Moments Universe:** A core, beautiful experience for identifying visual moments
+4. Preview video segments without downloading entire videos
+5. Two-tier moment detection: Rules -> Local LLM (admin-granted)
+6. Extract frames at selected timestamps
+7. Upload frames to external image hosting
+8. Generate final AI-consumable artifact with embedded images
 
-### 2.3 Non-Functional Requirements
+### 2.4 Non-Functional Requirements
 
 - **Zero-Friction Start:** Core functionality works without signup
 - **Responsiveness:** UI must remain fluid during backend processing
@@ -95,7 +126,7 @@ A web application that extracts YouTube transcripts and enriches them with visua
 |  |  +----------------+ +----------------+ +------------------------+| |
 |  |  +----------------+ +----------------+ +------------------------+| |
 |  |  | Frame Review   | | Export         | | Processing Status      || |
-|  |  | Galaxy         | | Controls       | | (WebSocket)            || |
+|  |  | Gallery        | | Controls       | | (WebSocket)            || |
 |  |  +----------------+ +----------------+ +------------------------+| |
 |  +------------------------------------------------------------------+ |
 +-----------------------------------------------------------------------+
@@ -107,12 +138,13 @@ A web application that extracts YouTube transcripts and enriches them with visua
 |  +------------------------------------------------------------------+ |
 |  |                      API Gateway Layer                           | |
 |  |  - Rate limiting   - Session/Auth    - Tailscale Admin Check     | |
+|  |  - CORS headers                                                   | |
 |  +------------------------------------------------------------------+ |
 |  +------------------------------------------------------------------+ |
 |  |                        Service Layer                             | |
 |  |  +----------------+ +----------------+ +------------------------+| |
 |  |  | Transcript     | | Video Segment  | | Moment Detection       || |
-|  |  | Extractor      | | Manager        | | Engine (3-tier)        || |
+|  |  | Extractor      | | Manager        | | Engine (2-tier)        || |
 |  |  +----------------+ +----------------+ +------------------------+| |
 |  |  +----------------+ +----------------+ +------------------------+| |
 |  |  | Frame          | | Image Upload   | | Artifact Compiler      || |
@@ -131,9 +163,9 @@ A web application that extracts YouTube transcripts and enriches them with visua
           +------------------------+------------------------+
           v                        v                        v
 +------------------+    +------------------+    +----------------------+
-| YouTube          |    | Google Cloud     |    | Tailscale            |
-| (via yt-dlp)     |    | - Gemini API     |    | - Admin identity     |
-|                  |    | - OAuth          |    | - Network-level ACL  |
+| YouTube          |    | Ollama           |    | Tailscale            |
+| (via yt-dlp)     |    | - Local LLM      |    | - Admin identity     |
+|                  |    | - Qwen2.5-1.5B   |    | - Network-level ACL  |
 +------------------+    +------------------+    +----------------------+
 ```
 
@@ -157,62 +189,21 @@ A web application that extracts YouTube transcripts and enriches them with visua
 |   Features:              Features:              Features:             |
 |   - Full core UX         - All anonymous        - All identified      |
 |   - Session storage      - Persistent data      - Feature flag ctrl   |
-|   - No persistence       - Cloud LLM access     - Local LLM toggle    |
-|   - Rate limited         - Higher rate limits   - Usage dashboards    |
-|                          - History              - User management     |
+|   - No persistence       - Higher rate limits   - Local LLM toggle    |
+|   - Rate limited         - History              - Usage dashboards    |
+|                                                 - User management     |
 |                                                                       |
 +-----------------------------------------------------------------------+
 ```
 
-### 4.2 Anonymous Sessions
+### 4.2 Identified Users (Hanko)
 
-**Every visitor gets full core functionality without any signup.**
-
-**Implementation:**
-
-```typescript
-// Client-side session management
-interface AnonymousSession {
-  id: string;           // UUID, generated on first visit
-  createdAt: string;
-  lastActiveAt: string;
-  currentVideoId?: string;
-  selectedMoments: VisualMoment[];
-}
-
-// Stored in localStorage, sent as header
-// X-Session-ID: uuid-here
-```
-
-**Storage Strategy:**
-
-- Session ID stored in `localStorage` (persists across tabs/refreshes)
-- Fallback to `sessionStorage` if localStorage unavailable
-- Server maintains session data for 24 hours after last activity
-- Anonymous sessions can be "upgraded" to identified accounts (data migrates)
-
-**Rate Limits (Anonymous):**
-
-```
-+---------------------+-------+------------+
-| Action              | Limit | Window     |
-+---------------------+-------+------------+
-| Video extractions   | 10    | per hour   |
-| Segment downloads   | 50    | per hour   |
-| Frame extractions   | 30    | per hour   |
-| Exports             | 5     | per hour   |
-+---------------------+-------+------------+
-```
-
-### 4.3 Identified Users (Hanko)
-
-**Decision:** Use **Hanko** (open-source, self-hostable) for passkey-first authentication with optional Google social login.
+**Decision:** Use **Hanko** (open-source, self-hostable) for passkey-first authentication with email magic link fallback.
 
 **Why Hanko?**
 
 - Open source, self-hostable (fits our KVM 4)
 - Passkey-first with fallback to email magic links
-- **Built-in social login support** including Google OAuth
 - Beautiful, customizable drop-in UI components
 - No vendor lock-in
 - Active development, strong community
@@ -224,7 +215,7 @@ interface AnonymousSession {
 - Modern UX that feels premium
 - Offloads security to user's device/biometrics
 
-**Authentication Options Flow:**
+**Authentication Flow:**
 
 ```
 +-----------------------------------------------------------------------+
@@ -235,12 +226,11 @@ interface AnonymousSession {
 |   +---------------------------------------------------------------+   |
 |   |                   HANKO AUTH UI                               |   |
 |   |                                                               |   |
-|   |   +-------------------------+  +---------------------------+  |   |
-|   |   |                         |  |                           |  |   |
-|   |   |   [*] Create Passkey   |  |   [G] Continue with        |  |   |
-|   |   |       (Recommended)     |  |       Google              |  |   |
-|   |   |                         |  |                           |  |   |
-|   |   +-------------------------+  +---------------------------+  |   |
+|   |   +-------------------------------------------------------+   |   |
+|   |   |                                                       |   |   |
+|   |   |   [*] Create Passkey (Recommended)                    |   |   |
+|   |   |                                                       |   |   |
+|   |   +-------------------------------------------------------+   |   |
 |   |                                                               |   |
 |   |   +-------------------------------------------------------+   |   |
 |   |   |  [...] Email magic link (fallback)                    |   |   |
@@ -249,43 +239,19 @@ interface AnonymousSession {
 |   +---------------------------------------------------------------+   |
 |                         |                                             |
 |          +--------------+--------------+                              |
-|          |              |              |                              |
-|          v              v              v                              |
-|      Passkey        Google         Email                              |
-|      Created        OAuth          Link Sent                          |
-|          |              |              |                              |
+|          |                             |                              |
+|          v                             v                              |
+|      Passkey                       Email                              |
+|      Created                       Link Sent                          |
+|          |                             |                              |
 |          +--------------+--------------+                              |
 |                         |                                             |
 |                         v                                             |
 |                  User Authenticated                                   |
 |                  (Hanko session created)                              |
-|                         |                                             |
-|                         v                                             |
-|        +--------------------------------+                             |
-|        | Wants Gemini AI features?      |                             |
-|        +--------------------------------+                             |
-|                    |           |                                      |
-|                    v           v                                      |
-|                   No          Yes                                     |
-|                    |           |                                      |
-|                    |           v                                      |
-|                    |   +-----------------------------+                |
-|                    |   | Additional Google OAuth     |                |
-|                    |   | (Gemini + YouTube scopes)   |                |
-|                    |   +-----------------------------+                |
-|                    |           |                                      |
-|                    v           v                                      |
-|               Done         AI Features Unlocked                       |
 |                                                                       |
 +-----------------------------------------------------------------------+
 ```
-
-**Key Insight:** Hanko's Google social login is for **authentication** (proving identity). The separate Google OAuth for Gemini is for **authorization** (accessing Gemini API). These serve different purposes:
-
-1. User signs up via Hanko with Google -> We know who they are
-2. User later clicks "Enable AI features" -> We get Gemini API access token
-
-If user originally signed up with Google via Hanko, the second OAuth flow is even smoother (Google remembers the consent).
 
 **Hanko Deployment (on KVM 4):**
 
@@ -297,17 +263,13 @@ services:
     environment:
       - DATABASE_URL=postgres://hanko:password@postgres:5432/hanko
       - SECRETS_KEYS=${HANKO_SECRET_KEY}
-      - WEBAUTHN_RELYING_PARTY_ID=yourdomain.com
-      - WEBAUTHN_RELYING_PARTY_ORIGIN=https://yourdomain.com
-      - PASSCODE_EMAIL_FROM_ADDRESS=auth@yourdomain.com
-      - PASSCODE_SMTP_HOST=smtp.yourprovider.com
-      - PASSCODE_SMTP_PORT=587
+      - WEBAUTHN_RELYING_PARTY_ID=${DOMAIN}
+      - WEBAUTHN_RELYING_PARTY_ORIGIN=https://${DOMAIN}
+      - PASSCODE_EMAIL_FROM_ADDRESS=auth@${DOMAIN}
+      - PASSCODE_SMTP_HOST=${SMTP_HOST}
+      - PASSCODE_SMTP_PORT=${SMTP_PORT}
       - PASSCODE_SMTP_USER=${SMTP_USER}
       - PASSCODE_SMTP_PASSWORD=${SMTP_PASSWORD}
-      # Google social login
-      - THIRD_PARTY_PROVIDERS_GOOGLE_ENABLED=true
-      - THIRD_PARTY_PROVIDERS_GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
-      - THIRD_PARTY_PROVIDERS_GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
     ports:
       - "127.0.0.1:8001:8000"  # Only local, proxied by Caddy
     depends_on:
@@ -333,7 +295,7 @@ volumes:
 import { Hanko } from "@teamhanko/hanko-elements";
 
 // Initialize
-const hankoApi = "https://yourdomain.com/hanko";
+const hankoApi = `https://${process.env.NEXT_PUBLIC_DOMAIN}/hanko`;
 const hanko = new Hanko(hankoApi);
 
 // Auth component (drop-in)
@@ -345,7 +307,7 @@ export function AuthPage() {
   );
 }
 
-// Profile component (manage passkeys, connected accounts)
+// Profile component (manage passkeys)
 export function ProfilePage() {
   return (
     <div className="profile-container">
@@ -359,113 +321,7 @@ const isLoggedIn = await hanko.session.isValid();
 const user = await hanko.user.getCurrent();
 ```
 
-**Session Upgrade (Anonymous -> Identified):**
-
-```python
-async def upgrade_session(anonymous_id: str, user_id: str):
-    """Migrate anonymous session data to identified user."""
-    anon_data = await get_anonymous_session(anonymous_id)
-    if anon_data:
-        # Migrate moments, history, preferences
-        await merge_into_user_account(user_id, anon_data)
-        await delete_anonymous_session(anonymous_id)
-        
-        # Log upgrade for analytics
-        await log_event("session_upgraded", {
-            "anonymous_id": anonymous_id,
-            "user_id": user_id,
-            "moments_migrated": len(anon_data.selected_moments)
-        })
-```
-
-### 4.4 Google OAuth (For Gemini + YouTube Integration)
-
-**Decision:** Offer optional Google OAuth for users who want Cloud LLM features. This is separate from Hanko's Google social login.
-
-**Why Separate OAuth Flows?**
-
-```
-Hanko Google Login:
-  Scopes: openid, email, profile
-  Purpose: Prove identity
-  We get: User info for account creation
-  
-Gemini Google OAuth:
-  Scopes: generative-language, youtube.readonly (optional)
-  Purpose: API access authorization
-  We get: Access token for Gemini API calls
-```
-
-**Scopes Requested (Gemini OAuth):**
-
-```
-https://www.googleapis.com/auth/generative-language.retriever
-https://www.googleapis.com/auth/youtube.readonly  (optional)
-```
-
-**OAuth Consent Screen Copy:**
-
-```
-+---------------------------------------------------------------+
-|                                                               |
-|   [App Logo]  YourAppName wants to access your Google Account |
-|                                                               |
-|   This will allow YourAppName to:                             |
-|                                                               |
-|   [check] Use Google AI services (Gemini)                     |
-|           For smart visual moment detection                   |
-|                                                               |
-|   [check] View your YouTube account (optional)                |
-|           To access unlisted videos you own                   |
-|                                                               |
-|   YourAppName will not be able to:                            |
-|   - See your Google password                                  |
-|   - Access your Gmail or Drive                                |
-|   - Make purchases or changes to your account                 |
-|                                                               |
-|            [Cancel]        [Allow]                            |
-|                                                               |
-+---------------------------------------------------------------+
-```
-
-**UI for Enabling AI Features:**
-
-```
-+---------------------------------------------------------------+
-|                                                               |
-|  .:. Enhance with AI                                          |
-|                                                               |
-|  Get smarter moment suggestions by connecting your Google     |
-|  account. We'll use Gemini to analyze transcripts.            |
-|                                                               |
-|  +-----------------------------------------------------------+|
-|  |                                                           ||
-|  |  This grants access to:                                   ||
-|  |  [x] Gemini AI (for smart suggestions)                    ||
-|  |  [ ] Your YouTube library (for unlisted videos) [?]       ||
-|  |                                                           ||
-|  |  We never store your Google password.                     ||
-|  |  Disconnect anytime in settings.                          ||
-|  |                                                           ||
-|  |  [    Connect Google Account    ]                         ||
-|  |                                                           ||
-|  +-----------------------------------------------------------+|
-|                                                               |
-|  --------------------------or---------------------------------|
-|                                                               |
-|  [Continue without AI] --> Uses rule-based detection only     |
-|                                                               |
-+---------------------------------------------------------------+
-```
-
-**Token Storage:**
-
-- Access tokens stored server-side, encrypted at rest
-- Refresh tokens stored securely, auto-refresh on expiry
-- Tokens scoped to user, never shared
-- User can revoke via settings (we also call Google's revoke endpoint)
-
-### 4.5 Admin Access via Tailscale
+### 4.3 Admin Access via Tailscale
 
 **Decision:** Admin functionality is only accessible from the Tailscale network. No code-level auth checks needed -- network topology *is* the auth.
 
@@ -474,7 +330,6 @@ https://www.googleapis.com/auth/youtube.readonly  (optional)
 - Zero-trust networking without VPN complexity
 - Identity tied to your Tailscale account
 - Can expose specific routes only to your tailnet
-- Already have it set up (your requirement!)
 - Elegant: if you can reach the admin route, you're authorized
 
 **Implementation via Caddy:**
@@ -525,7 +380,7 @@ https://www.googleapis.com/auth/youtube.readonly  (optional)
 
 ```caddyfile
 # Public-facing (Internet)
-yourdomain.com {
+{$DOMAIN} {
     # Hanko authentication server
     handle /hanko/* {
         reverse_proxy localhost:8001
@@ -548,14 +403,13 @@ yourdomain.com {
 }
 
 # Tailscale-only (Admin)
-# This listens on the Tailscale IP, not the public IP
-http://<your-tailscale-hostname>:8443 {
+http://{$TAILSCALE_HOSTNAME}:8443 {
     # Admin routes - full access
     handle /admin/* {
         reverse_proxy localhost:8000
     }
     
-    # Also proxy regular routes for convenience when on tailnet
+    # Also proxy regular routes for convenience
     handle /api/* {
         reverse_proxy localhost:8000
     }
@@ -577,17 +431,346 @@ http://<your-tailscale-hostname>:8443 {
 | Rate Limit Override    | Adjust limits for specific users         |
 | Cache Management       | View/clear cache, see stats              |
 | System Health          | Resource usage, queue depth              |
-| LLM Usage Dashboard    | Gemini API calls, token counts           |
 +------------------------+------------------------------------------+
 ```
 
-**Admin UI Location:** `http://<tailscale-hostname>:8443/admin` (only reachable via Tailscale)
+---
+
+## 5. Session Management
+
+### 5.1 Session Types
+
+The system supports two session types with different storage characteristics:
+
+```
++------------------+------------------+------------------------------------+
+| Aspect           | Anonymous        | Identified                         |
++------------------+------------------+------------------------------------+
+| Creation         | Auto on first    | After Hanko authentication         |
+|                  | visit            |                                    |
++------------------+------------------+------------------------------------+
+| Client Storage   | localStorage     | localStorage (Hanko token)         |
+|                  | (session UUID)   |                                    |
++------------------+------------------+------------------------------------+
+| Server Storage   | SQLite           | SQLite (linked to user account)    |
++------------------+------------------+------------------------------------+
+| Data Retention   | 24 hours after   | Indefinite (until user deletes)    |
+|                  | last activity    |                                    |
++------------------+------------------+------------------------------------+
+| Upgrade Path     | Can upgrade to   | N/A (already identified)           |
+|                  | identified       |                                    |
++------------------+------------------+------------------------------------+
+```
+
+### 5.2 Anonymous Sessions
+
+**Every visitor gets full core functionality without any signup.**
+
+**Client-Side Implementation:**
+
+```typescript
+interface AnonymousSession {
+  id: string;           // UUID, generated on first visit
+  createdAt: string;
+  lastActiveAt: string;
+  currentVideoId?: string;
+  selectedMoments: VisualMoment[];
+}
+
+// Stored in localStorage, sent as header: X-Session-ID: uuid-here
+// Fallback to sessionStorage if localStorage unavailable
+```
+
+### 5.3 Session Lifecycle
+
+```
+1. Session Start
+   '-> Client connects
+   '-> If no session ID in localStorage: generate UUID, send to server
+   '-> Server creates session record in SQLite
+   '-> Server loads any existing cache locks for this session from DB
+
+2. Segment Request  
+   '-> Each viewed segment is locked to that session
+   '-> Lock stored in both memory (for fast access) and SQLite (for persistence)
+   '-> Lock prevents eviction during active viewing
+
+3. Heartbeat
+   '-> Client sends ping every 30 seconds via WebSocket or REST
+   '-> Updates session's last_active_at timestamp
+   '-> Failure to heartbeat for 2 minutes triggers lock release
+
+4. Lock Release (2-minute heartbeat timeout)
+   '-> All segment locks for session are released
+   '-> Session DATA is NOT deleted (only locks)
+   '-> Allows cache eviction of previously-locked segments
+   '-> User can continue working; segments re-lock on next request
+
+5. Session Data Expiry (24 hours for anonymous)
+   '-> Anonymous session data deleted after 24 hours of inactivity
+   '-> Identified user session data persists indefinitely
+
+6. Session Upgrade (Anonymous -> Identified)
+   '-> User authenticates via Hanko
+   '-> Anonymous session data migrated to user account
+   '-> Anonymous session record deleted
+   '-> New identified session created with same working state
+
+7. Graceful Degradation
+   '-> If segment evicted while user inactive (locks released)
+   '-> Client receives "segment unavailable" response
+   '-> Client can re-request (will re-download and re-lock)
+   '-> User sees brief "Reloading preview..." message
+```
+
+**Key Distinction:**
+- **Lock timeout:** 2 minutes without heartbeat releases segment locks
+- **Data retention:** 24 hours for anonymous sessions, indefinite for identified users
+
+### 5.4 Session Upgrade Flow
+
+```python
+async def upgrade_session(anonymous_id: str, hanko_user_id: str) -> str:
+    """
+    Migrate anonymous session data to identified user account.
+    Returns the new identified session ID.
+    """
+    anon_data = await get_anonymous_session(anonymous_id)
+    
+    if anon_data:
+        # Get or create user record
+        user = await get_or_create_user(hanko_user_id)
+        
+        # Migrate moments, history, preferences
+        await merge_into_user_account(user.id, anon_data)
+        
+        # Transfer any active segment locks
+        await transfer_locks(anonymous_id, user.id)
+        
+        # Delete anonymous session
+        await delete_anonymous_session(anonymous_id)
+        
+        # Log upgrade for analytics
+        await log_event("session_upgraded", {
+            "anonymous_id": anonymous_id,
+            "user_id": user.id,
+            "moments_migrated": len(anon_data.selected_moments)
+        })
+    
+    # Create new identified session
+    return await create_identified_session(user.id)
+```
+
+### 5.5 WebSocket Connection Management
+
+**Connection:** `wss://{domain}/ws/session/{sessionId}`
+
+**Reconnection Strategy:**
+
+```typescript
+class WebSocketManager {
+  private ws: WebSocket | null = null;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 10;
+  private lastEventId: string | null = null;
+  
+  connect(sessionId: string) {
+    const url = `wss://${domain}/ws/session/${sessionId}`;
+    
+    // Include last event ID for replay on reconnect
+    const params = this.lastEventId 
+      ? `?lastEventId=${this.lastEventId}` 
+      : '';
+    
+    this.ws = new WebSocket(url + params);
+    
+    this.ws.onopen = () => {
+      this.reconnectAttempts = 0;
+      // Server will replay missed events if lastEventId provided
+    };
+    
+    this.ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      this.lastEventId = data.eventId;
+      this.handleEvent(data);
+    };
+    
+    this.ws.onclose = () => {
+      this.scheduleReconnect(sessionId);
+    };
+  }
+  
+  private scheduleReconnect(sessionId: string) {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.onMaxRetriesExceeded();
+      return;
+    }
+    
+    // Exponential backoff: 1s, 2s, 4s, 8s... max 30s
+    const delay = Math.min(
+      1000 * Math.pow(2, this.reconnectAttempts),
+      30000
+    );
+    
+    this.reconnectAttempts++;
+    setTimeout(() => this.connect(sessionId), delay);
+  }
+}
+```
+
+**Server-Side Event Replay:**
+
+```python
+# Server maintains recent events per session (last 5 minutes)
+# On reconnect with lastEventId, replay all events after that ID
+
+async def handle_websocket_connect(
+    websocket: WebSocket,
+    session_id: str,
+    last_event_id: Optional[str] = None
+):
+    await websocket.accept()
+    
+    # Replay missed events
+    if last_event_id:
+        missed_events = await get_events_after(session_id, last_event_id)
+        for event in missed_events:
+            await websocket.send_json(event)
+    
+    # Continue normal operation
+    await session_event_loop(websocket, session_id)
+```
 
 ---
 
-## 5. Mobile-First Accessibility Design
+## 6. Rate Limiting & Quotas
 
-### 5.1 Design Philosophy
+### 6.1 Storage
+
+**Decision:** Rate limits stored in SQLite alongside other application data.
+
+```sql
+-- Rate limit tracking
+CREATE TABLE rate_limits (
+    key TEXT PRIMARY KEY,          -- "{session_or_user_id}:{action}:{window}"
+    count INTEGER NOT NULL,
+    window_start TEXT NOT NULL,    -- ISO timestamp
+    expires_at TEXT NOT NULL       -- For cleanup
+);
+
+CREATE INDEX idx_rate_limits_expires ON rate_limits(expires_at);
+```
+
+**Implementation:**
+
+```python
+from datetime import datetime, timedelta
+
+async def check_rate_limit(
+    identifier: str,  # session_id or user_id
+    action: str,
+    limit: int,
+    window_seconds: int
+) -> tuple[bool, int]:
+    """
+    Check if action is allowed under rate limit.
+    Returns (allowed, remaining_count).
+    """
+    window_start = datetime.utcnow().replace(
+        second=0, microsecond=0
+    ) - timedelta(seconds=datetime.utcnow().second % window_seconds)
+    
+    key = f"{identifier}:{action}:{window_start.isoformat()}"
+    
+    async with db.transaction():
+        row = await db.fetchone(
+            "SELECT count FROM rate_limits WHERE key = ?",
+            (key,)
+        )
+        
+        current_count = row["count"] if row else 0
+        
+        if current_count >= limit:
+            return False, 0
+        
+        # Increment or insert
+        expires_at = window_start + timedelta(seconds=window_seconds * 2)
+        await db.execute("""
+            INSERT INTO rate_limits (key, count, window_start, expires_at)
+            VALUES (?, 1, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET count = count + 1
+        """, (key, window_start.isoformat(), expires_at.isoformat()))
+        
+        return True, limit - current_count - 1
+
+# Periodic cleanup (run via Huey scheduled task)
+async def cleanup_expired_rate_limits():
+    await db.execute(
+        "DELETE FROM rate_limits WHERE expires_at < ?",
+        (datetime.utcnow().isoformat(),)
+    )
+```
+
+### 6.2 Limits by User Type
+
+**Anonymous Users:**
+
+```
++---------------------+-------+------------+
+| Action              | Limit | Window     |
++---------------------+-------+------------+
+| Video extractions   | 10    | per hour   |
+| Segment downloads   | 50    | per hour   |
+| Frame extractions   | 30    | per hour   |
+| Exports             | 5     | per hour   |
++---------------------+-------+------------+
+```
+
+**Identified Users:**
+
+```
++---------------------+-------+------------+
+| Action              | Limit | Window     |
++---------------------+-------+------------+
+| Video extractions   | 30    | per hour   |
+| Segment downloads   | 150   | per hour   |
+| Frame extractions   | 100   | per hour   |
+| Exports             | 20    | per hour   |
+| LLM analyses        | 10    | per hour   |
++---------------------+-------+------------+
+```
+
+**Admin Override:**
+
+Admins can set a `rate_limit_multiplier` per user (e.g., 2.0 = double limits).
+
+### 6.3 Response Headers
+
+All API responses include rate limit information:
+
+```
+X-RateLimit-Limit: 30
+X-RateLimit-Remaining: 27
+X-RateLimit-Reset: 1702656000
+```
+
+### 6.4 Exceeded Limit Response
+
+```json
+{
+  "error": "rate_limit_exceeded",
+  "message": "Video extraction limit reached. Try again in 47 minutes.",
+  "retry_after_seconds": 2820
+}
+```
+
+HTTP Status: `429 Too Many Requests`
+
+---
+
+## 7. Mobile-First Accessibility Design
+
+### 7.1 Design Philosophy
 
 **"Fat fingers are not a bug, they're the primary use case."**
 
@@ -598,7 +781,7 @@ Every interactive element must be designed assuming the user:
 - Is in motion (on transit, walking)
 - Might accidentally tap adjacent elements
 
-### 5.2 Touch Target Standards
+### 7.2 Touch Target Standards
 
 **Minimum Sizes (Non-Negotiable):**
 
@@ -638,7 +821,6 @@ Every interactive element must be designed assuming the user:
 **Implementation:**
 
 ```tsx
-// Touch-friendly button wrapper
 const TouchTarget = ({ children, onTap, minSize = 48 }) => (
   <motion.button
     onClick={onTap}
@@ -650,7 +832,6 @@ const TouchTarget = ({ children, onTap, minSize = 48 }) => (
       justifyContent: 'center',
     }}
     whileTap={{ scale: 0.95 }}
-    // Haptic feedback on supported devices
     onTapStart={() => navigator.vibrate?.(10)}
   >
     {children}
@@ -658,7 +839,7 @@ const TouchTarget = ({ children, onTap, minSize = 48 }) => (
 );
 ```
 
-### 5.3 Gesture-Based Interactions
+### 7.3 Gesture-Based Interactions
 
 **Replace Small Buttons with Gestures:**
 
@@ -670,28 +851,23 @@ const TouchTarget = ({ children, onTap, minSize = 48 }) => (
 | Tiny edit/delete icons    | Swipe left on item        | Natural, intuitive |
 | Small +/- buttons         | Pinch to zoom timeline    | Intuitive, precise |
 | Checkbox for select       | Long-press to select      | Harder to mis-tap  |
-| Settings gear icon        | Pull down past top        | Hidden but there   |
 +---------------------------+---------------------------+--------------------+
 ```
 
 **Gesture Implementation (Moments Universe):**
 
 ```tsx
-// Timeline segment with gesture controls
 <motion.div
   drag="x"
   dragConstraints={{ left: 0, right: 0 }}
   dragElastic={0.2}
   onDragEnd={(e, info) => {
     if (info.offset.x < -100) {
-      // Swiped left: delete moment
       onDeleteMoment();
     } else if (info.offset.x > 100) {
-      // Swiped right: confirm moment
       onConfirmMoment();
     }
   }}
-  // Visual feedback during drag
   style={{
     x: dragX,
     backgroundColor: dragX < -50 ? 'rgba(255,0,0,0.1)' : 
@@ -703,27 +879,26 @@ const TouchTarget = ({ children, onTap, minSize = 48 }) => (
 </motion.div>
 ```
 
-### 5.4 Mobile Layout Patterns
+### 7.4 Mobile Layout Patterns
 
 **Bottom Sheet for Actions (Not Modals):**
 
 ```
-Desktop:                          Mobile:
-+---------------------+          +---------------------+
-|                     |          |                     |
-|  +---------------+  |          |                     |
-|  |    Modal      |  |          |                     |
-|  |   (centered)  |  |    vs    |                     |
-|  |               |  |          |                     |
-|  +---------------+  |          +---------------------+
-|                     |          | =================== |<-- Drag handle
-+---------------------+          |                     |
-                                 |   Bottom Sheet      |<-- Thumb zone
-                                 |   (actions here)    |
-                                 |                     |
-                                 |  [ Big Button ]     |
-                                 |                     |
-                                 +---------------------+
+Mobile:
++---------------------+
+|                     |
+|                     |
+|                     |
+|                     |
++---------------------+
+| =================== |<-- Drag handle
+|                     |
+|   Bottom Sheet      |<-- Thumb zone
+|   (actions here)    |
+|                     |
+|  [ Big Button ]     |
+|                     |
++---------------------+
 ```
 
 **Thumb Zone Optimization:**
@@ -747,7 +922,7 @@ Desktop:                          Mobile:
         ^ Thumb naturally rests here
 ```
 
-### 5.5 Forgiving Interactions
+### 7.5 Forgiving Interactions
 
 **Error Prevention:**
 
@@ -765,7 +940,6 @@ Desktop:                          Mobile:
 **Undo Everything:**
 
 ```tsx
-// Every destructive action is reversible
 const handleDeleteMoment = async (momentId: string) => {
   // Optimistically remove from UI
   setMoments(prev => prev.filter(m => m.id !== momentId));
@@ -788,75 +962,11 @@ const handleDeleteMoment = async (momentId: string) => {
 };
 ```
 
-### 5.6 Mobile-Specific Moments Universe
-
-**Portrait Mode Layout:**
-
-```
-+-------------------------------------+
-|  <  Video Title Here...         [=] |  <-- Compact header
-+-------------------------------------+
-|                                     |
-|  +-------------------------------+  |
-|  |                               |  |
-|  |      Video Preview            |  |  <-- 16:9 aspect
-|  |      (Segment Player)         |  |
-|  |                               |  |
-|  +-------------------------------+  |
-|                                     |
-|  ....####......######....#......... |  <-- Timeline (expandable)
-|                                     |
-+-------------------------------------+
-|                                     |
-|  Transcript                    [Q]  |
-|  -----------------------------------+
-|                                     |
-|  | 0:00  Welcome to today's...      |
-|  |                                  |  <-- Scrollable
-|  | 0:15  As you can see here... *   |  <-- * = moment marker
-|  |                                  |
-|  | 0:32  The diagram shows...  *    |
-|  |                                  |
-|                                     |
-|                            ( + )    |  <-- FAB for adding moments
-|                                     |
-+-------------------------------------+
-|                                     |
-|  =================================  |  <-- Bottom sheet handle
-|                                     |
-|  Moments (3)             [Export]   |
-|                                     |
-|  +------+ +------+ +------+         |  <-- Horizontal scroll
-|  | [##] | | [##] | | [##] |         |
-|  | 0:15 | | 0:32 | | 1:45 |         |
-|  +------+ +------+ +------+         |
-|                                     |
-+-------------------------------------+
-```
-
-**Landscape Mode (Immersive Player):**
-
-```
-+------------------------------------------------------------------------+
-|                                                                        |
-|                                                                        |
-|                    Video Preview (Full Width)                          |
-|                                                                        |
-|                                                                        |
-+------------------------------------------------------------------------+
-| ....####......######....########....#..........###########.........*   |
-| ^                                                                  ^   |
-| Tap anywhere to seek                           Tap * to jump to moment |
-|                                                                        |
-| [Exit]                                        [Mark Moment] (large)    |
-+------------------------------------------------------------------------+
-```
-
 ---
 
-## 6. The Moments Universe (Core Feature)
+## 8. The Moments Universe (Core Feature)
 
-### 6.1 Concept
+### 8.1 Concept
 
 The **Moments Universe** is not just a feature -- it's the soul of the application. It's where users discover, select, and curate the visual moments that transform a transcript into a complete, AI-comprehensible document.
 
@@ -867,7 +977,7 @@ The **Moments Universe** is not just a feature -- it's the soul of the applicati
 3. **Forgiving:** Wrong selections are trivially reversible
 4. **Beautiful:** This is where we go all-in on cool factor
 
-### 6.2 Visual Design: The Timeline Constellation
+### 8.2 Visual Design: The Timeline Constellation
 
 ```
 +-----------------------------------------------------------------------+
@@ -899,7 +1009,7 @@ The **Moments Universe** is not just a feature -- it's the soul of the applicati
 +-----------------------------------------------------------------------+
 ```
 
-### 6.3 Moment States & Animations
+### 8.3 Moment States & Animations
 
 **State Machine:**
 
@@ -910,13 +1020,13 @@ The **Moments Universe** is not just a feature -- it's the soul of the applicati
                     +-----------+
                           |
            +--------------+--------------+
-           |              |              |
-           v              v              v
-   +---------------+ +---------+ +---------------+
-   | AUTO-DETECTED | |  USER   | |  RULE-BASED   |
-   |   (by LLM)    | | SELECTED| |   (pattern)   |
-   +-------+-------+ +----+----+ +-------+-------+
-           |              |              |
+           |                             |
+           v                             v
+   +---------------+             +---------------+
+   | AUTO-DETECTED |             |  USER         |
+   | (by LLM/rules)|             | SELECTED      |
+   +-------+-------+             +-------+-------+
+           |                             |
            +--------------+--------------+
                           |
                           v
@@ -961,12 +1071,11 @@ The **Moments Universe** is not just a feature -- it's the soul of the applicati
 +----------------------+----------------------------+----------+----------------+
 ```
 
-### 6.4 Moment Picker Mode
+### 8.4 Moment Picker Mode
 
 When user activates moment picking:
 
 ```tsx
-// Full-screen takeover for moment selection
 <AnimatePresence>
   {pickingMode && (
     <motion.div
@@ -975,19 +1084,15 @@ When user activates moment picking:
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
     >
-      {/* Darkened overlay */}
       <div className="absolute inset-0 bg-black/80" />
       
-      {/* Spotlight follows cursor/touch */}
       <SpotlightCursor 
         size={200}
-        color="rgba(147, 51, 234, 0.3)"  // Purple glow
+        color="rgba(147, 51, 234, 0.3)"
       />
       
-      {/* Expanded video */}
       <VideoPreview expanded />
       
-      {/* Expanded timeline */}
       <motion.div
         initial={{ height: 60 }}
         animate={{ height: 160 }}
@@ -995,11 +1100,10 @@ When user activates moment picking:
       >
         <ExpandedTimeline 
           onMark={handleMarkMoment}
-          precision="frame"  // Frame-accurate in this mode
+          precision="frame"
         />
       </motion.div>
       
-      {/* Instructions */}
       <div className="fixed top-4 left-1/2 -translate-x-1/2">
         <motion.p
           initial={{ y: -20, opacity: 0 }}
@@ -1010,7 +1114,6 @@ When user activates moment picking:
         </motion.p>
       </div>
       
-      {/* Exit button (large, accessible) */}
       <motion.button
         className="fixed top-4 right-4 p-4"
         whileTap={{ scale: 0.9 }}
@@ -1022,7 +1125,7 @@ When user activates moment picking:
 </AnimatePresence>
 ```
 
-### 6.5 Frame Preview Gallery
+### 8.5 Frame Preview Gallery
 
 After moments are confirmed and frames extracted:
 
@@ -1059,11 +1162,11 @@ After moments are confirmed and frames extracted:
 
 ---
 
-## 7. Moment Detection Engine (3-Tier System)
+## 9. Moment Detection Engine (2-Tier System)
 
-### 7.1 Architecture Overview
+### 9.1 Architecture Overview
 
-**Decision:** Three distinct detection modes, progressively more intelligent, with clear user control.
+**Decision:** Two distinct detection modes, with clear user control.
 
 ```
 +-----------------------------------------------------------------------+
@@ -1071,17 +1174,16 @@ After moments are confirmed and frames extracted:
 |                                                                       |
 |   Mode Selection (User Controlled)                                    |
 |                                                                       |
-|   +--------------+   +--------------+   +--------------+              |
-|   |    [=]       |   |   (cloud)    |   |    <cpu>     |              |
-|   |   RULES      |   |    CLOUD     |   |    LOCAL     |              |
-|   |   ONLY       |   |   (Gemini)   |   |   (Ollama)   |              |
-|   |              |   |              |   |              |              |
-|   |  Default     |   |  Requires    |   |  Admin       |              |
-|   |  Always on   |   |  Google      |   |  granted     |              |
-|   |              |   |  OAuth       |   |  only        |              |
-|   +--------------+   +--------------+   +--------------+              |
-|          |                 |                 |                        |
-|          v                 v                 v                        |
+|   +-----------------------+        +-----------------------+          |
+|   |         [=]           |        |        <cpu>          |          |
+|   |     RULES ONLY        |        |    RULES + LOCAL      |          |
+|   |                       |        |       (Ollama)        |          |
+|   |     Default           |        |                       |          |
+|   |     Always on         |        |    Admin-granted      |          |
+|   |                       |        |    only               |          |
+|   +-----------------------+        +-----------------------+          |
+|              |                              |                         |
+|              v                              v                         |
 |   +---------------------------------------------------------------+   |
 |   |           Combined Results --> Deduplicated                   |   |
 |   +---------------------------------------------------------------+   |
@@ -1089,7 +1191,7 @@ After moments are confirmed and frames extracted:
 +-----------------------------------------------------------------------+
 ```
 
-### 7.2 Tier 1: Rule-Based Detection (Always Active)
+### 9.2 Tier 1: Rule-Based Detection (Always Active)
 
 **Decision:** Sophisticated pattern matching that catches 60-70% of visual moments without any ML.
 
@@ -1148,12 +1250,12 @@ VISUAL_MOMENT_PATTERNS = {
 
 # Confidence weights by category
 CATEGORY_WEIGHTS = {
-    "deictic_explicit": 0.95,    # Very high confidence
-    "deictic_implicit": 0.75,    # Good confidence
-    "code_demo": 0.85,           # High for tech content
-    "ui_navigation": 0.80,       # High for tutorials
-    "transitions": 0.70,         # Medium - might be false positive
-    "physical_demo": 0.90,       # High confidence
+    "deictic_explicit": 0.95,
+    "deictic_implicit": 0.75,
+    "code_demo": 0.85,
+    "ui_navigation": 0.80,
+    "transitions": 0.70,
+    "physical_demo": 0.90,
 }
 ```
 
@@ -1165,9 +1267,7 @@ def calculate_moment_confidence(
     matches: List[PatternMatch],
     context: AnalysisContext
 ) -> float:
-    """
-    Adjust confidence based on context.
-    """
+    """Adjust confidence based on context."""
     base_confidence = max(m.category_weight for m in matches)
     
     # Boost: Multiple patterns in same segment
@@ -1183,7 +1283,7 @@ def calculate_moment_confidence(
         base_confidence -= 0.15
     
     # Penalty: Pattern appears very frequently (speaker's verbal tic)
-    if context.pattern_frequency[matches[0].pattern] > 0.1:  # >10% of segments
+    if context.pattern_frequency[matches[0].pattern] > 0.1:
         base_confidence -= 0.20
     
     # Boost: Follows or precedes silence (intentional pause)
@@ -1206,193 +1306,14 @@ class RuleBasedMoment:
     reason: str  # Human-readable explanation
 ```
 
-### 7.3 Tier 2: Cloud LLM (Gemini via User's Google Account)
-
-**Decision:** Use **Gemini 1.5 Flash** via user's own Google OAuth. No API keys, no BYOK, no cost to us.
-
-**Why Gemini 1.5 Flash?**
-
-- Available via Google AI Studio free tier (60 requests/minute!)
-- Accessible through user's existing Google account
-- Fast inference (hence "Flash")
-- Good at structured extraction tasks
-- Generous context window (1M tokens) for long transcripts
-
-**Quota & Limits (Free Tier):**
-
-```
-+--------------------+------------+------------------------+
-| Metric             | Limit      | Our Usage Pattern      |
-+--------------------+------------+------------------------+
-| Requests/minute    | 60         | ~1-3 per video         |
-| Requests/day       | 1,500      | More than enough       |
-| Tokens/minute      | 1,000,000  | Transcripts are small  |
-+--------------------+------------+------------------------+
-```
-
-**Implementation Flow:**
-
-```
-+-----------------------------------------------------------------------+
-|                                                                       |
-|   User clicks "Enhance with AI"                                       |
-|                           |                                           |
-|                           v                                           |
-|   +---------------------------------------------------------------+   |
-|   |  Has valid Google OAuth token with Gemini scope?              |   |
-|   +---------------------------------------------------------------+   |
-|                           |                                           |
-|              +------------+------------+                              |
-|              |                         |                              |
-|              v No                      v Yes                          |
-|   +---------------------+   +-------------------------------------+   |
-|   | Trigger OAuth flow  |   | Call Gemini API with user's token   |   |
-|   | (via our app)       |   |                                     |   |
-|   +---------------------+   +-------------------------------------+   |
-|                                         |                             |
-|                                         v                             |
-|                           +-----------------------------------+       |
-|                           | Parse response --> Visual moments |       |
-|                           +-----------------------------------+       |
-|                                                                       |
-+-----------------------------------------------------------------------+
-```
-
-**API Call (via Google AI SDK):**
-
-```python
-import google.generativeai as genai
-from google.oauth2.credentials import Credentials
-
-async def analyze_with_gemini(
-    transcript: Transcript,
-    user_access_token: str,
-    user_refresh_token: str
-) -> List[LLMMoment]:
-    """
-    Call Gemini using user's OAuth token.
-    """
-    # Build credentials from user's tokens
-    credentials = Credentials(
-        token=user_access_token,
-        refresh_token=user_refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=settings.GOOGLE_CLIENT_ID,
-        client_secret=settings.GOOGLE_CLIENT_SECRET,
-    )
-    
-    # Configure genai with user credentials
-    genai.configure(credentials=credentials)
-    
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    
-    # Chunked analysis for long transcripts
-    chunks = chunk_transcript(transcript, max_tokens=8000, overlap=500)
-    all_moments = []
-    
-    for chunk in chunks:
-        response = await model.generate_content_async(
-            GEMINI_PROMPT.format(transcript=chunk.text),
-            generation_config={
-                "response_mime_type": "application/json",
-                "temperature": 0.2,  # Low for consistency
-            }
-        )
-        
-        moments = parse_gemini_response(response.text)
-        all_moments.extend(moments)
-    
-    return deduplicate_moments(all_moments, threshold_seconds=5)
-```
-
-**Gemini Prompt:**
-
-```python
-GEMINI_PROMPT = """You are analyzing a video transcript to identify \
-moments where visual context is essential for understanding.
-
-A "visual moment" is when:
-1. The speaker explicitly references something visible \
-("as you can see", "look at this")
-2. On-screen content (code, diagrams, text) is being discussed
-3. A physical demonstration is happening
-4. Visual comparison or transition occurs
-5. Context would be significantly lost without seeing the video
-
-Analyze this transcript segment and identify visual moments.
-
-IMPORTANT:
-- Be selective. Not every timestamp is a visual moment.
-- Prefer moments where the visual adds essential context, not just \
-"nice to have"
-- If the speaker says "um, you know, like, here" that's probably \
-not a strong visual moment
-- Technical tutorials have more visual moments than talking-head \
-discussions
-
-Return ONLY valid JSON in this exact format:
-{{
-  "moments": [
-    {{
-      "timestamp_seconds": <number>,
-      "confidence": <0.0-1.0>,
-      "reason": "<brief explanation>",
-      "visual_type": "<diagram|code|demonstration|ui|comparison|other>"
-    }}
-  ]
-}}
-
-If no visual moments exist, return: {{"moments": []}}
-
-TRANSCRIPT:
-{transcript}
-"""
-```
-
-**Usage Tracking (For User Transparency):**
-
-```python
-# Store in user's session/account
-@dataclass
-class GeminiUsage:
-    user_id: str
-    date: str  # YYYY-MM-DD
-    requests_count: int
-    tokens_used: int
-    
-async def track_gemini_usage(user_id: str, tokens: int):
-    today = datetime.now().strftime("%Y-%m-%d")
-    usage = await get_or_create_usage(user_id, today)
-    usage.requests_count += 1
-    usage.tokens_used += tokens
-    await save_usage(usage)
-```
-
-**UI for Usage Display:**
-
-```
-+---------------------------------------------------------------+
-|  AI Enhancement                                   Connected + |
-|  -------------------------------------------------------------+
-|                                                               |
-|  Using: Gemini 1.5 Flash (via your Google account)            |
-|                                                               |
-|  Today's usage: 12 / 1,500 requests                           |
-|  ####................................... 0.8%                 |
-|                                                               |
-|  [Disconnect Google Account]                                  |
-|                                                               |
-+---------------------------------------------------------------+
-```
-
-### 7.4 Tier 3: Local LLM (Admin-Granted Feature)
+### 9.3 Tier 2: Local LLM (Admin-Granted Feature)
 
 **Decision:** Self-hosted Ollama with small model, enabled per-user via admin feature flag.
 
 **Why Feature-Flagged?**
 
 - Local LLM consumes server resources (RAM, CPU)
-- Not everyone needs it (Cloud tier is usually sufficient)
+- Not everyone needs it (rule-based tier catches most cases)
 - Allows you to grant access to trusted users/testers
 - Keeps base experience snappy for casual users
 
@@ -1408,15 +1329,26 @@ async def track_gemini_usage(user_id: str, tokens: int):
 +------------------------+------+--------+---------+------------------+
 ```
 
+**Ollama Configuration:**
+
+```bash
+# Install Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Pull model
+ollama pull qwen2.5:1.5b-instruct-q4_K_M
+
+# Configure memory behavior (in environment)
+export OLLAMA_KEEP_ALIVE=2m  # Unload model after 2 min idle
+```
+
 **Feature Flag System:**
 
 ```python
-# Database schema
 class UserFeatureFlags(BaseModel):
     user_id: str
     local_llm_enabled: bool = False
     local_llm_granted_at: Optional[datetime] = None
-    local_llm_granted_by: str = "admin"  # Always admin for now
     
 # Admin endpoint (Tailscale-only)
 @router.post("/admin/users/{user_id}/features/local-llm")
@@ -1425,39 +1357,48 @@ async def toggle_local_llm(
     enabled: bool,
     request: Request
 ):
-    # No auth check needed - Tailscale network IS the auth
     await update_feature_flag(user_id, "local_llm_enabled", enabled)
     await log_admin_action(
-        admin_ip=request.client.host,  # Tailscale IP for audit
+        admin_ip=request.client.host,
         action=f"Set local_llm={enabled} for {user_id}"
     )
     return {"status": "updated"}
 ```
 
-**UI Indication:**
+**LLM Prompt:**
 
+```python
+LOCAL_LLM_PROMPT = """Analyze this transcript segment to identify visual moments.
+
+A "visual moment" is when:
+1. The speaker explicitly references something visible
+2. On-screen content (code, diagrams, text) is being discussed
+3. A physical demonstration is happening
+4. Visual comparison or transition occurs
+5. Context would be significantly lost without seeing the video
+
+Be selective. Not every timestamp is a visual moment.
+
+Return JSON only:
+{
+  "moments": [
+    {
+      "timestamp_seconds": <number>,
+      "confidence": <0.0-1.0>,
+      "reason": "<brief explanation>",
+      "visual_type": "<diagram|code|demonstration|ui|comparison|other>"
+    }
+  ]
+}
+
+TRANSCRIPT:
+{transcript}
+"""
 ```
-+---------------------------------------------------------------+
-|  Moment Detection Mode                                        |
-|  -------------------------------------------------------------+
-|                                                               |
-|  ( ) Rules Only (fast, no AI)                                 |
-|                                                               |
-|  ( ) Rules + Cloud AI (requires Google account)               |
-|                                                               |
-|  (*) Rules + Local AI **                                      |
-|      '-> Enabled by admin. Runs on our server.                |
-|      '-> May be slower during high usage.                     |
-|                                                               |
-+---------------------------------------------------------------+
-```
 
-### 7.5 Mode Switching UI
-
-**Decision:** Simple toggle group in settings panel, with smart defaults.
+### 9.4 Mode Switching UI
 
 ```tsx
-// MomentDetectionSettings component
 const MomentDetectionSettings = () => {
   const { user, features } = useAuth();
   const [mode, setMode] = useDetectionMode();
@@ -1467,7 +1408,6 @@ const MomentDetectionSettings = () => {
       <h3 className="font-medium">Moment Detection</h3>
       
       <RadioGroup value={mode} onValueChange={setMode}>
-        {/* Always available */}
         <RadioItem value="rules">
           <div className="flex items-center gap-2">
             <RulerIcon className="w-4 h-4" />
@@ -1475,35 +1415,10 @@ const MomentDetectionSettings = () => {
             <Badge variant="secondary">Fast</Badge>
           </div>
           <p className="text-sm text-muted-foreground">
-            Pattern matching, no AI. Works offline.
+            Pattern matching, no AI. Works instantly.
           </p>
         </RadioItem>
         
-        {/* Requires Google OAuth */}
-        <RadioItem 
-          value="cloud" 
-          disabled={!user?.googleConnected}
-        >
-          <div className="flex items-center gap-2">
-            <CloudIcon className="w-4 h-4" />
-            <span>Rules + Cloud AI</span>
-            <Badge variant="default">Recommended</Badge>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            Uses Gemini via your Google account.
-          </p>
-          {!user?.googleConnected && (
-            <Button 
-              size="sm" 
-              variant="outline" 
-              onClick={connectGoogle}
-            >
-              Connect Google
-            </Button>
-          )}
-        </RadioItem>
-        
-        {/* Requires admin feature flag */}
         <RadioItem 
           value="local"
           disabled={!features?.localLlmEnabled}
@@ -1512,11 +1427,11 @@ const MomentDetectionSettings = () => {
             <CpuIcon className="w-4 h-4" />
             <span>Rules + Local AI</span>
             {features?.localLlmEnabled && (
-              <Badge variant="outline">** Enabled</Badge>
+              <Badge variant="outline">Enabled</Badge>
             )}
           </div>
           <p className="text-sm text-muted-foreground">
-            Runs on our server. Admin-granted access.
+            Smarter detection. Admin-granted access.
           </p>
           {!features?.localLlmEnabled && (
             <p className="text-xs text-muted-foreground">
@@ -1530,9 +1445,7 @@ const MomentDetectionSettings = () => {
 };
 ```
 
-### 7.6 Result Merging & Deduplication
-
-When multiple tiers are active, results must be intelligently merged:
+### 9.5 Result Merging & Deduplication
 
 ```python
 async def detect_moments(
@@ -1540,24 +1453,15 @@ async def detect_moments(
     mode: DetectionMode,
     user: Optional[User]
 ) -> List[DetectedMoment]:
-    """
-    Run detection based on mode, merge results.
-    """
+    """Run detection based on mode, merge results."""
     all_moments: List[DetectedMoment] = []
     
     # Tier 1: Rules (always)
     rule_moments = await detect_with_rules(transcript)
     all_moments.extend(rule_moments)
     
-    # Tier 2 or 3: LLM (if enabled and authorized)
-    if mode == DetectionMode.CLOUD and user and user.google_token:
-        llm_moments = await detect_with_gemini(
-            transcript, 
-            user.google_token,
-            user.google_refresh_token
-        )
-        all_moments.extend(llm_moments)
-    elif mode == DetectionMode.LOCAL and user and user.features.local_llm_enabled:
+    # Tier 2: Local LLM (if enabled and authorized)
+    if mode == DetectionMode.LOCAL and user and user.features.local_llm_enabled:
         llm_moments = await detect_with_ollama(transcript)
         all_moments.extend(llm_moments)
     
@@ -1570,7 +1474,6 @@ async def detect_moments(
     # Combine confidences for duplicates
     for moment in merged:
         if moment.sources_count > 1:
-            # Boost confidence when multiple sources agree
             moment.confidence = min(moment.confidence + 0.15, 1.0)
     
     return merged
@@ -1578,9 +1481,9 @@ async def detect_moments(
 
 ---
 
-## 8. Video Segment Strategy
+## 10. Video Segment Strategy
 
-### 8.1 Segment-Based Downloads
+### 10.1 Segment-Based Downloads
 
 **Decision:** Download video in segments on-demand, not complete files.
 
@@ -1591,7 +1494,7 @@ Full video downloads are wasteful -- a 1-hour video at 360p is ~200-400MB. Users
 
 ```bash
 yt-dlp --download-sections "*00:05:00-00:05:30" \
-       --format "worst[height>=360]" \
+       --format "best[height<=720][height>=360]" \
        -o "segments/%(id)s_%(section_start)s.%(ext)s" \
        "https://youtube.com/watch?v=..."
 ```
@@ -1599,29 +1502,113 @@ yt-dlp --download-sections "*00:05:00-00:05:30" \
 **Segment Strategy:**
 
 - Initial transcript fetch: metadata only, no video download
-- User scrolls to timestamp: trigger 30-second segment download centered on that point
+- User seeks to timestamp: trigger segment download centered on that point
+- Segment boundaries snap to nearest keyframes (yt-dlp handles this)
 - Segments are cached and painted on the player timeline
 - Adjacent segment prefetching when user hovers near segment boundaries
 
 **Quality Selection:**
 
+The format string `best[height<=720][height>=360]` selects the best quality between 360p and 720p, maximizing functionality for videos that might only be available in 720p.
+
 ```
 +------------+-----------------+------------------+-------------------+
 | Resolution | Bitrate (approx)| 30s Segment Size | Use Case          |
 +------------+-----------------+------------------+-------------------+
-| 360p       | 500 kbps        | ~2 MB            | ** DEFAULT **     |
-| 480p       | 1000 kbps       | ~4 MB            | User requests HD  |
-| 240p       | 300 kbps        | ~1 MB            | Bandwidth fallback|
+| 360p       | 500 kbps        | ~2 MB            | Lower bandwidth   |
+| 480p       | 1000 kbps       | ~4 MB            | Balanced          |
+| 720p       | 2500 kbps       | ~9 MB            | Best available    |
 +------------+-----------------+------------------+-------------------+
 ```
 
-**Why 360p default:** Sufficient to distinguish visual content (is there a diagram? a person? text on screen?) without excessive storage. Most "is this a visual moment?" decisions don't require HD.
+**Why 720p ceiling:** Sufficient to distinguish visual content clearly. Most "is this a visual moment?" decisions don't require 1080p+, and the storage/bandwidth savings are significant.
+
+### 10.2 yt-dlp Segment Download Precision
+
+**Important caveat:** The `--download-sections` option aligns downloads to keyframes, so the actual downloaded segment may be slightly longer than requested (typically a few seconds on each end). This is expected behavior.
+
+**Potential issues:**
+
+- Some videos (live streams, DRM-protected) don't support sectioned download
+- Network interruptions during download require full retry
+
+**Fallback behavior:**
+
+```python
+async def download_segment(
+    video_id: str,
+    start: float,
+    end: float,
+    output_path: Path
+) -> SegmentResult:
+    """Download segment with fallback for unsupported videos."""
+    try:
+        result = await _download_section(video_id, start, end, output_path)
+        return result
+    except SectionDownloadUnsupported:
+        # Fallback: download lowest quality full video, extract section with ffmpeg
+        # This is slower but works for all video types
+        full_path = await _download_full_video(video_id, quality="worst")
+        await _extract_section_ffmpeg(full_path, start, end, output_path)
+        return SegmentResult(path=output_path, fallback_used=True)
+```
+
+If fallback is triggered, UI shows: "This video requires slower processing. Please wait..."
+
+### 10.3 Transcript Language Selection
+
+When a video has multiple transcript tracks:
+
+```python
+async def get_transcript(video_id: str, preferred_lang: Optional[str] = None) -> Transcript:
+    """
+    Get transcript, prompting for language selection if multiple available.
+    """
+    available = await list_available_transcripts(video_id)
+    
+    if not available:
+        raise TranscriptUnavailable(
+            error_code="VIDEO_NO_TRANSCRIPT",
+            message="This video doesn't have captions. Try a different video."
+        )
+    
+    if len(available) == 1:
+        return await fetch_transcript(video_id, available[0].lang_code)
+    
+    if preferred_lang and preferred_lang in [t.lang_code for t in available]:
+        return await fetch_transcript(video_id, preferred_lang)
+    
+    # Multiple available, no preference: return list for user selection
+    raise LanguageSelectionRequired(
+        available_languages=available,
+        message="Multiple transcript languages available. Please select one."
+    )
+```
+
+**UI Flow:**
+
+```
++---------------------------------------------------------------+
+|                                                               |
+|   Multiple languages available                                |
+|                                                               |
+|   +-------------------------------------------------------+   |
+|   |  ( ) English (auto-generated)                         |   |
+|   |  ( ) English                                          |   |
+|   |  (*) Spanish                                          |   |
+|   |  ( ) Portuguese (Brazil)                              |   |
+|   +-------------------------------------------------------+   |
+|                                                               |
+|   [  Continue with Spanish  ]                                 |
+|                                                               |
++---------------------------------------------------------------+
+```
 
 ---
 
-## 9. Cache Architecture & Session Locking
+## 11. Cache Architecture
 
-### 9.1 Directory Structure
+### 11.1 Directory Structure
 
 ```
 /var/cache/yttool/
@@ -1630,29 +1617,22 @@ yt-dlp --download-sections "*00:05:00-00:05:30" \
 |   '-- ...
 |-- frames/                      # Extracted frame images
 |   '-- {video_id}_{timestamp}.jpg
-|-- metadata/                    # Transcript + video info
-|   '-- {video_id}.json
-'-- locks/                       # Session lock files
-    '-- {session_id}.lock        # Contains locked segment IDs
+'-- metadata/                    # Transcript + video info
+    '-- {video_id}.json
 ```
 
-### 9.2 Two-Tier Cache with Locks
+### 11.2 LRU Cache with Session-Aware Locking
 
 **Problem:**  
-With a 10GB cache ceiling, a rotation policy might evict segments that a user is actively previewing. This would cause playback failures and a broken experience.
+With a 10GB cache ceiling, a rotation policy might evict segments that a user is actively previewing. This would cause playback failures.
 
-**Solution:** LRU cache with session-aware locking to prevent active segment eviction.
+**Solution:** LRU cache with session-aware locking. Locks are persisted in SQLite and loaded on startup to survive server restarts.
 
 ```python
-# Cache manager implementation
-
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Set, Optional
+from typing import Dict, Set
 import asyncio
-import logging
-
-logger = logging.getLogger(__name__)
 
 @dataclass
 class CachedSegment:
@@ -1667,19 +1647,32 @@ class CachedSegment:
 
 
 class CacheManager:
-    def __init__(self, cache_dir: Path, max_size_gb: float = 10.0):
+    def __init__(self, cache_dir: Path, db: Database, max_size_gb: float = 10.0):
         self.cache_dir = cache_dir
+        self.db = db
         self.max_bytes = int(max_size_gb * 1024**3)
         self.segments_dir = cache_dir / "segments"
         self.frames_dir = cache_dir / "frames"
         self.metadata_dir = cache_dir / "metadata"
         
-        # Session locks: session_id -> set of segment_ids
-        self.locks: Dict[str, Set[str]] = {}
+        # In-memory lock cache (mirrors DB for fast access)
+        self._locks: Dict[str, Set[str]] = {}
         
-        # Ensure directories exist
         for d in [self.segments_dir, self.frames_dir, self.metadata_dir]:
             d.mkdir(parents=True, exist_ok=True)
+    
+    async def initialize(self):
+        """Load locks from database on startup."""
+        rows = await self.db.fetchall("""
+            SELECT session_id, segment_id FROM segment_locks
+            WHERE expires_at > datetime('now')
+        """)
+        for row in rows:
+            session_id = row["session_id"]
+            segment_id = row["segment_id"]
+            if session_id not in self._locks:
+                self._locks[session_id] = set()
+            self._locks[session_id].add(segment_id)
     
     async def acquire_segment(
         self, 
@@ -1688,59 +1681,61 @@ class CacheManager:
         start_time: float,
         end_time: float
     ) -> Path:
-        """
-        Get segment path, downloading if needed.
-        Locks segment against eviction for this session.
-        """
+        """Get segment path, downloading if needed. Locks segment to session."""
         segment_id = f"{video_id}_{int(start_time)}_{int(end_time)}"
         segment_path = self.segments_dir / f"{segment_id}.mp4"
         
-        # Lock this segment to the session
-        if session_id not in self.locks:
-            self.locks[session_id] = set()
-        self.locks[session_id].add(segment_id)
+        # Lock in memory
+        if session_id not in self._locks:
+            self._locks[session_id] = set()
+        self._locks[session_id].add(segment_id)
+        
+        # Persist lock to DB
+        await self._persist_lock(session_id, segment_id)
         
         # Download if not cached
         if not segment_path.exists():
             await self._download_segment(video_id, start_time, end_time, segment_path)
         
-        # Update access time for LRU
         await self._touch_segment(segment_id)
-        
-        # Trigger eviction check (non-blocking)
         asyncio.create_task(self._maybe_evict())
         
         return segment_path
     
-    def release_session(self, session_id: str):
-        """
-        Called on session end/timeout. Releases all locks.
-        """
-        if session_id in self.locks:
-            released_count = len(self.locks[session_id])
-            del self.locks[session_id]
-            logger.info(f"Released {released_count} segment locks for session {session_id}")
-            
-            # Trigger eviction since we freed locks
-            asyncio.create_task(self._maybe_evict())
+    async def _persist_lock(self, session_id: str, segment_id: str):
+        """Persist lock to database."""
+        expires_at = datetime.utcnow() + timedelta(minutes=5)
+        await self.db.execute("""
+            INSERT INTO segment_locks (session_id, segment_id, expires_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(session_id, segment_id) DO UPDATE SET expires_at = ?
+        """, (session_id, segment_id, expires_at, expires_at))
+    
+    async def release_session_locks(self, session_id: str):
+        """Release all locks for a session (on timeout or disconnect)."""
+        if session_id in self._locks:
+            del self._locks[session_id]
+        
+        await self.db.execute(
+            "DELETE FROM segment_locks WHERE session_id = ?",
+            (session_id,)
+        )
+        
+        asyncio.create_task(self._maybe_evict())
     
     async def _maybe_evict(self):
-        """
-        Evict oldest unlocked segments until under max_size.
-        """
+        """Evict oldest unlocked segments until under max_size."""
         current_size = await self._calculate_current_size()
         
         if current_size <= self.max_bytes:
             return
         
-        # Gather all locked segments across all sessions
+        # Gather all locked segments
         locked_segments: Set[str] = set()
-        for session_locks in self.locks.values():
+        for session_locks in self._locks.values():
             locked_segments.update(session_locks)
         
-        # Get segments sorted by last access (oldest first)
         segments = await self._get_segments_sorted_by_access()
-        
         bytes_to_free = current_size - self.max_bytes
         bytes_freed = 0
         
@@ -1749,125 +1744,16 @@ class CacheManager:
                 break
                 
             if segment.id in locked_segments:
-                # Skip locked segments
                 continue
             
-            # Delete this segment
             try:
                 segment.path.unlink()
                 bytes_freed += segment.size_bytes
-                logger.info(f"Evicted segment {segment.id} ({segment.size_bytes} bytes)")
             except Exception as e:
-                logger.error(f"Failed to evict segment {segment.id}: {e}")
-        
-        if bytes_freed < bytes_to_free:
-            logger.warning(
-                f"Cache full but could only free {bytes_freed} of "
-                f"{bytes_to_free} bytes needed. "
-                f"{len(locked_segments)} segments are locked."
-            )
-    
-    async def _download_segment(
-        self, 
-        video_id: str, 
-        start: float, 
-        end: float, 
-        output_path: Path
-    ):
-        """Download segment using yt-dlp."""
-        import subprocess
-        
-        url = f"https://youtube.com/watch?v={video_id}"
-        section = f"*{self._format_time(start)}-{self._format_time(end)}"
-        
-        cmd = [
-            "yt-dlp",
-            "--download-sections", section,
-            "--format", "worst[height>=360]",
-            "--output", str(output_path),
-            "--quiet",
-            url
-        ]
-        
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        
-        if proc.returncode != 0:
-            raise Exception(f"yt-dlp failed: {stderr.decode()}")
-    
-    @staticmethod
-    def _format_time(seconds: float) -> str:
-        """Format seconds as HH:MM:SS for yt-dlp."""
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    
-    async def _calculate_current_size(self) -> int:
-        """Sum size of all cached segments."""
-        total = 0
-        for path in self.segments_dir.glob("*.mp4"):
-            total += path.stat().st_size
-        return total
-    
-    async def _get_segments_sorted_by_access(self) -> list:
-        """Get all segments sorted by last access time (oldest first)."""
-        # Implementation would read from DB or file metadata
-        # Simplified here
-        pass
-    
-    async def _touch_segment(self, segment_id: str):
-        """Update last access time for segment."""
-        # Implementation would update DB or file metadata
-        pass
+                logger.error(f"Failed to evict {segment.id}: {e}")
 ```
 
-**Step-by-step UX for seeking to uncached regions:**
-
-1. User seeks to uncached region
-2. Timeline shows "loading" animation for that segment
-3. Video displays "Loading preview..." placeholder
-4. Segment downloads (2-4 seconds for 30s @ 360p)
-5. Video begins playing from requested timestamp
-6. Adjacent segments prefetch in background
-
-**Notes on gapless playback (nice-to-have):**
-- Preload next segment's first few seconds into buffer
-- Use MediaSource API for seamless switching
-- Fall back to brief loading indicator if segment not ready
-
-### 9.3 Session Lifecycle
-
-```
-1. Session Start
-   '-> Client connects, gets session ID (UUID)
-   '-> Session stored server-side with creation time
-
-2. Segment Request  
-   '-> Each viewed segment is locked to that session
-   '-> Lock prevents eviction during active viewing
-
-3. Heartbeat
-   '-> Client sends ping every 30 seconds
-   '-> Updates session's last_active timestamp
-
-4. Session End
-   '-> Explicit close (user navigates away)
-   '-> OR 2 minutes without heartbeat --> timeout
-   '-> Releases all segment locks
-
-5. Graceful Degradation
-   '-> If segment somehow evicted mid-session (edge case)
-   '-> Client receives "segment unavailable" response
-   '-> Client can re-request (will re-download)
-   '-> User sees brief "Reloading preview..." message
-```
-
-### 9.4 Failure Scenarios & UX
+### 11.3 Failure Scenarios & UX
 
 ```
 +----------------------------------+-------------------------+--------------------+
@@ -1876,48 +1762,44 @@ class CacheManager:
 | Segment evicted while locked     | Should never happen     | N/A                |
 |                                  | (lock prevents this)    |                    |
 +----------------------------------+-------------------------+--------------------+
-| User leaves tab open for hours   | Session times out,      | Segments may need  |
-|                                  | locks released          | re-download; shows |
+| User inactive > 2 min            | Locks released,         | Segments may need  |
+|                                  | data retained           | re-download; shows |
 |                                  |                         | "Refreshing..."    |
 +----------------------------------+-------------------------+--------------------+
-| Cache completely full, all       | Log warning, refuse     | "Server busy,      |
-| segments locked                  | new sessions            | try again shortly" |
+| Cache full, all segments locked  | Log warning, refuse     | "Server busy,      |
+|                                  | new segment requests    | try again shortly" |
 +----------------------------------+-------------------------+--------------------+
 | Segment download fails (network) | Retry 2x with backoff   | "Couldn't load,    |
 |                                  |                         | retrying..."       |
 +----------------------------------+-------------------------+--------------------+
-| Session reconnects after timeout | New session ID,         | Transparent if     |
-|                                  | segments re-locked if   | cached; brief      |
-|                                  | still in cache          | reload if not      |
+| Server restart                   | Locks loaded from DB    | Transparent        |
 +----------------------------------+-------------------------+--------------------+
 ```
 
 ---
 
-## 10. Process Management & Concurrency Control
+## 12. Process Management & Concurrency Control
 
-### 10.1 Task Queue: Huey with SQLite
+### 12.1 Task Queue: Huey with SQLite
 
-**Decision:** Use `huey` with SQLite backend for task queue, plus asyncio semaphores for fine-grained resource limits.
+**Decision:** Use `huey` with SQLite backend for task queue, plus asyncio semaphores for resource limits.
 
-**Why Not Celery?**  
-Celery is overkill and requires Redis/RabbitMQ. Huey uses SQLite -- zero additional services.
+**Why Huey?**  
+Lightweight, SQLite-backed (no Redis required), good enough for our scale.
 
-**Why Not Just asyncio?**  
-Need persistence. If the server restarts mid-task, we want to resume, not lose work.
-
-**Setup:**
+**Configuration:**
 
 ```python
 from huey import SqliteHuey
 
-# Task queue configuration
+# Worker count: 1 by default, configurable via environment
+HUEY_WORKERS = int(os.getenv("HUEY_WORKERS", "1"))
+
 huey = SqliteHuey(
     filename='/var/lib/yttool/tasks.db',
-    immediate=False,  # Use queue, don't run synchronously
+    immediate=False,
 )
 
-# Example background task
 @huey.task()
 def extract_frames_task(video_id: str, timestamps: list[float]):
     """Extract frames at given timestamps. Runs in background."""
@@ -1925,97 +1807,72 @@ def extract_frames_task(video_id: str, timestamps: list[float]):
         extract_single_frame(video_id, ts)
     return {"status": "complete", "count": len(timestamps)}
 
-# Periodic cleanup task
-@huey.periodic_task(crontab(minute='0', hour='3'))  # 3 AM daily
-def cleanup_old_sessions():
-    """Remove expired sessions and unlock their segments."""
-    expired = get_expired_sessions(max_age_hours=24)
-    for session in expired:
-        cache_manager.release_session(session.id)
-        delete_session(session.id)
+@huey.periodic_task(crontab(minute='0', hour='3'))
+def cleanup_expired_data():
+    """Daily cleanup of expired sessions, rate limits, and orphaned cache."""
+    cleanup_expired_sessions(max_age_hours=24)
+    cleanup_expired_rate_limits()
+    cleanup_orphaned_cache_entries()
 ```
 
-### 10.2 Resource Limiters
+**Running the worker:**
+
+```bash
+huey_consumer app.tasks.huey --workers ${HUEY_WORKERS:-1} --worker-type thread
+```
+
+### 12.2 Resource Limiters
 
 ```python
 from contextlib import asynccontextmanager
 import asyncio
-import threading
 
 class ResourceLimiter:
-    """
-    Manages concurrency limits for resource-intensive operations.
-    Uses both asyncio semaphores (for async code) and threading 
-    semaphores (for huey workers).
-    """
+    """Manages concurrency limits for resource-intensive operations."""
     
     def __init__(self):
-        # Async semaphores (for FastAPI handlers)
-        self.async_llm = asyncio.Semaphore(1)
-        self.async_ffmpeg = asyncio.Semaphore(2)
-        self.async_download = asyncio.Semaphore(3)
-        
-        # Threading semaphores (for Huey workers)
-        self.thread_llm = threading.Semaphore(1)
-        self.thread_ffmpeg = threading.Semaphore(2)
-        self.thread_download = threading.Semaphore(3)
+        self.llm = asyncio.Semaphore(1)      # Only 1 LLM at a time
+        self.ffmpeg = asyncio.Semaphore(2)   # Max 2 ffmpeg processes
+        self.download = asyncio.Semaphore(3) # Max 3 concurrent downloads
     
     @asynccontextmanager
     async def llm_slot(self):
-        """Acquire LLM processing slot (async context)."""
-        async with self.async_llm:
+        async with self.llm:
             yield
     
     @asynccontextmanager
     async def ffmpeg_slot(self):
-        """Acquire ffmpeg processing slot (async context)."""
-        async with self.async_ffmpeg:
+        async with self.ffmpeg:
             yield
     
     @asynccontextmanager
     async def download_slot(self):
-        """Acquire download slot (async context)."""
-        async with self.async_download:
+        async with self.download:
             yield
-    
-    # Sync versions for Huey tasks
-    def acquire_llm_sync(self):
-        return self.thread_llm
-    
-    def acquire_ffmpeg_sync(self):
-        return self.thread_ffmpeg
 
-# Global instance
 limiter = ResourceLimiter()
 
-# Usage in async handler
+# Usage
 async def analyze_transcript_handler(video_id: str):
     async with limiter.llm_slot():
         result = await run_llm_analysis(video_id)
     return result
-
-# Usage in Huey task
-@huey.task()
-def analyze_transcript_task(video_id: str):
-    with limiter.acquire_llm_sync():
-        result = run_llm_analysis_sync(video_id)
-    return result
 ```
 
-### 10.3 Concurrency Limits (Tuned for KVM 4)
+### 12.3 Concurrency Limits (Tuned for KVM 4)
 
 ```
 +---------------------+----------------+----------------------------------+
 | Resource            | Max Concurrent | Rationale                        |
 +---------------------+----------------+----------------------------------+
-| LLM Inference       | 1              | Memory-bound; 2GB ceiling        |
+| LLM Inference       | 1              | Memory-bound; model is ~2GB      |
 | FFmpeg (frames)     | 2              | CPU-bound; leave cores for others|
 | yt-dlp downloads    | 3              | Network-bound; parallelism helps |
 | Total active sessions| 5             | Prevents cache explosion         |
 +---------------------+----------------+----------------------------------+
 ```
 
-### 10.4 Queue Priority
+### 12.4 Queue Priority
 
 Processing priority (highest to lowest):
 
@@ -2026,23 +1883,28 @@ Processing priority (highest to lowest):
 
 ---
 
-## 11. Data Models
+## 13. Data Models
 
-### 11.1 TypeScript Interfaces (Frontend)
+### 13.1 TypeScript Interfaces (Frontend)
 
 ```typescript
-// Video metadata (cached after first fetch)
 interface VideoMetadata {
-  id: string;                    // YouTube video ID
+  id: string;
   title: string;
   description: string;
-  duration: number;              // Total seconds
+  duration: number;
   channelName: string;
   thumbnailUrl: string;
-  fetchedAt: string;             // ISO timestamp
+  availableLanguages: TranscriptLanguage[];
+  fetchedAt: string;
 }
 
-// Transcript structure
+interface TranscriptLanguage {
+  code: string;       // e.g., "en", "es", "pt-BR"
+  name: string;       // e.g., "English", "Spanish"
+  isAutoGenerated: boolean;
+}
+
 interface Transcript {
   videoId: string;
   language: string;
@@ -2050,67 +1912,60 @@ interface Transcript {
 }
 
 interface TranscriptSegment {
-  start: number;                 // Start time in seconds
+  start: number;
   duration: number;
   text: string;
 }
 
-// Cached video segment
 interface VideoSegment {
-  id: string;                    // "{videoId}_{startSec}_{endSec}"
+  id: string;
   videoId: string;
   startTime: number;
   endTime: number;
-  quality: '240p' | '360p' | '480p';
+  quality: '360p' | '480p' | '720p';
   status: 'pending' | 'downloading' | 'ready' | 'error';
 }
 
-// User-selected moment
 interface VisualMoment {
-  id: string;                    // UUID
+  id: string;
   videoId: string;
-  timestamp: number;             // Seconds
+  timestamp: number;
   source: 'user' | 'rule' | 'llm';
-  confidence: number;            // 0.0 - 1.0
-  reason?: string;               // Why this was flagged
+  confidence: number;
+  reason?: string;
   status: 'pending' | 'confirmed' | 'dismissed' | 'extracted' | 'uploaded';
-  framePath?: string;            // Local path after extraction
-  uploadedUrl?: string;          // External URL after upload
+  framePath?: string;
+  uploadedUrl?: string;
 }
 
-// Session state
 interface UserSession {
-  id: string;                    // UUID
+  id: string;
   type: 'anonymous' | 'identified';
-  userId?: string;               // If identified
-  videoId?: string;              // Currently working on
+  userId?: string;
+  videoId?: string;
   createdAt: string;
   lastActiveAt: string;
   selectedMoments: VisualMoment[];
 }
 
-// User account (identified users)
 interface User {
   id: string;
   email?: string;
-  hankoId: string;               // From Hanko
-  googleConnected: boolean;
-  googleTokenExpiry?: string;
+  hankoId: string;
   features: UserFeatures;
   createdAt: string;
 }
 
 interface UserFeatures {
   localLlmEnabled: boolean;
-  rateLimitOverride?: number;    // Custom rate limit multiplier
+  rateLimitMultiplier?: number;
 }
 
-// Final artifact
 interface ExportArtifact {
   id: string;
   videoId: string;
   title: string;
-  format: 'markdown' | 'json' | 'plaintext';
+  format: 'markdown' | 'json';
   includesImages: boolean;
   momentCount: number;
   exportedAt: string;
@@ -2118,33 +1973,35 @@ interface ExportArtifact {
 }
 ```
 
-### 11.2 SQLite Schema (Backend)
+### 13.2 SQLite Schema (Backend)
 
 ```sql
--- Main database schema
-
 -- Video metadata cache
 CREATE TABLE videos (
-    id TEXT PRIMARY KEY,              -- YouTube video ID
+    id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     description TEXT,
     duration_seconds INTEGER NOT NULL,
     channel_name TEXT,
     thumbnail_url TEXT,
-    fetched_at TEXT NOT NULL          -- ISO timestamp
+    available_languages_json TEXT,  -- JSON array of language objects
+    fetched_at TEXT NOT NULL
 );
 
 -- Transcript cache
 CREATE TABLE transcripts (
-    video_id TEXT PRIMARY KEY REFERENCES videos(id),
-    language TEXT NOT NULL,
-    segments_json TEXT NOT NULL,      -- JSON array of segments
+    id TEXT PRIMARY KEY,           -- "{video_id}_{lang_code}"
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    language_code TEXT NOT NULL,
+    segments_json TEXT NOT NULL,
     fetched_at TEXT NOT NULL
 );
 
--- Cached video segments
+CREATE INDEX idx_transcripts_video ON transcripts(video_id);
+
+-- Cached video segments metadata
 CREATE TABLE cached_segments (
-    id TEXT PRIMARY KEY,              -- "{video_id}_{start}_{end}"
+    id TEXT PRIMARY KEY,
     video_id TEXT NOT NULL REFERENCES videos(id),
     start_time REAL NOT NULL,
     end_time REAL NOT NULL,
@@ -2158,13 +2015,22 @@ CREATE TABLE cached_segments (
 CREATE INDEX idx_segments_video ON cached_segments(video_id);
 CREATE INDEX idx_segments_access ON cached_segments(last_accessed_at);
 
+-- Segment locks (persisted for server restart survival)
+CREATE TABLE segment_locks (
+    session_id TEXT NOT NULL,
+    segment_id TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, segment_id)
+);
+
+CREATE INDEX idx_locks_expires ON segment_locks(expires_at);
+
 -- Anonymous sessions
 CREATE TABLE anonymous_sessions (
-    id TEXT PRIMARY KEY,              -- UUID
+    id TEXT PRIMARY KEY,
     video_id TEXT REFERENCES videos(id),
     created_at TEXT NOT NULL,
     last_active_at TEXT NOT NULL,
-    locked_segments_json TEXT DEFAULT '[]',
     selected_moments_json TEXT DEFAULT '[]'
 );
 
@@ -2172,13 +2038,9 @@ CREATE INDEX idx_anon_sessions_active ON anonymous_sessions(last_active_at);
 
 -- Identified users (synced with Hanko)
 CREATE TABLE users (
-    id TEXT PRIMARY KEY,              -- UUID
-    hanko_id TEXT UNIQUE NOT NULL,    -- From Hanko
+    id TEXT PRIMARY KEY,
+    hanko_id TEXT UNIQUE NOT NULL,
     email TEXT,
-    google_connected INTEGER DEFAULT 0,
-    google_access_token TEXT,         -- Encrypted
-    google_refresh_token TEXT,        -- Encrypted
-    google_token_expiry TEXT,
     created_at TEXT NOT NULL,
     last_login_at TEXT
 );
@@ -2193,47 +2055,58 @@ CREATE TABLE user_features (
 
 -- Identified user sessions
 CREATE TABLE user_sessions (
-    id TEXT PRIMARY KEY,              -- UUID
+    id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id),
     video_id TEXT REFERENCES videos(id),
     created_at TEXT NOT NULL,
     last_active_at TEXT NOT NULL,
-    locked_segments_json TEXT DEFAULT '[]',
     selected_moments_json TEXT DEFAULT '[]'
 );
 
 CREATE INDEX idx_user_sessions_user ON user_sessions(user_id);
 CREATE INDEX idx_user_sessions_active ON user_sessions(last_active_at);
 
+-- Rate limiting
+CREATE TABLE rate_limits (
+    key TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    window_start TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_rate_limits_expires ON rate_limits(expires_at);
+
 -- LLM auto-suggestions (cached per video)
 CREATE TABLE auto_suggestions (
-    id TEXT PRIMARY KEY,              -- UUID
+    id TEXT PRIMARY KEY,
     video_id TEXT NOT NULL REFERENCES videos(id),
     timestamp_seconds REAL NOT NULL,
     confidence REAL NOT NULL,
     reason TEXT,
     visual_type TEXT,
-    source TEXT NOT NULL,             -- 'rule', 'gemini', 'ollama'
+    source TEXT NOT NULL,          -- 'rule' or 'ollama'
     model_version TEXT,
     suggested_at TEXT NOT NULL
 );
 
 CREATE INDEX idx_suggestions_video ON auto_suggestions(video_id);
 
--- Gemini API usage tracking
-CREATE TABLE gemini_usage (
-    user_id TEXT NOT NULL REFERENCES users(id),
-    date TEXT NOT NULL,               -- YYYY-MM-DD
-    requests_count INTEGER DEFAULT 0,
-    tokens_used INTEGER DEFAULT 0,
-    PRIMARY KEY (user_id, date)
+-- WebSocket events (for replay on reconnect)
+CREATE TABLE ws_events (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
+
+CREATE INDEX idx_ws_events_session ON ws_events(session_id, created_at);
 
 -- Admin audit log
 CREATE TABLE admin_audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
-    admin_ip TEXT NOT NULL,           -- Tailscale IP
+    admin_ip TEXT NOT NULL,
     action TEXT NOT NULL,
     target_user_id TEXT,
     details_json TEXT
@@ -2242,9 +2115,30 @@ CREATE TABLE admin_audit_log (
 
 ---
 
-## 12. API Specification
+## 14. API Specification
 
-### 12.1 Endpoints Overview
+### 14.1 CORS Configuration
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        f"https://{os.getenv('DOMAIN')}",
+        "http://localhost:3000",  # Development
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_headers=["*"],
+    expose_headers=["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
+)
+```
+
+### 14.2 Endpoints Overview
 
 ```
 +--------+----------------------------------+----------------------------------------+
@@ -2252,7 +2146,8 @@ CREATE TABLE admin_audit_log (
 +--------+----------------------------------+----------------------------------------+
 | POST   | /api/videos/extract              | Fetch metadata + transcript for URL    |
 | GET    | /api/videos/{id}                 | Get cached video metadata              |
-| GET    | /api/videos/{id}/transcript      | Get transcript                         |
+| GET    | /api/videos/{id}/transcript      | Get transcript (with language param)   |
+| GET    | /api/videos/{id}/languages       | List available transcript languages    |
 | POST   | /api/videos/{id}/analyze         | Trigger moment detection               |
 | GET    | /api/videos/{id}/suggestions     | Get detected moments                   |
 +--------+----------------------------------+----------------------------------------+
@@ -2274,11 +2169,6 @@ CREATE TABLE admin_audit_log (
 | POST   | /api/export                      | Generate final artifact                |
 | GET    | /api/export/{id}/download        | Download generated artifact            |
 +--------+----------------------------------+----------------------------------------+
-| GET    | /api/auth/google/authorize       | Start Google OAuth flow                |
-| GET    | /api/auth/google/callback        | OAuth callback                         |
-| DELETE | /api/auth/google                 | Disconnect Google account              |
-| GET    | /api/auth/gemini/usage           | Get user's Gemini usage stats          |
-+--------+----------------------------------+----------------------------------------+
 | WS     | /ws/session/{id}                 | Real-time updates (progress, etc.)     |
 +--------+----------------------------------+----------------------------------------+
 | GET    | /admin/dashboard                 | Admin overview (Tailscale only)        |
@@ -2290,26 +2180,35 @@ CREATE TABLE admin_audit_log (
 +--------+----------------------------------+----------------------------------------+
 ```
 
-### 12.2 Key Endpoint Details
+### 14.3 Key Endpoint Details
 
 **POST /api/videos/extract**
 
 ```typescript
 // Request
 { 
-  url: string;  // YouTube URL
+  url: string;
+  preferredLanguage?: string;  // Optional language code
 }
 
-// Response
+// Response (success)
 {
   video: VideoMetadata;
   transcript: Transcript;
-  cached: boolean;  // Whether we already had this
+  cached: boolean;
+}
+
+// Response (language selection required)
+{
+  error: "language_selection_required",
+  video: VideoMetadata,
+  availableLanguages: TranscriptLanguage[]
 }
 
 // Errors
 // 400: Invalid URL
-// 404: Video not found or unavailable
+// 404: VIDEO_NOT_FOUND - Video not found or unavailable
+// 404: VIDEO_NO_TRANSCRIPT - Video has no captions
 // 429: Rate limit exceeded
 ```
 
@@ -2322,15 +2221,16 @@ CREATE TABLE admin_audit_log (
   videoId: string;
   timestamp: number;    // Center point in seconds
   duration?: number;    // Default 30
-  quality?: '240p' | '360p' | '480p';  // Default 360p
 }
 
 // Response
 {
   segmentId: string;
   status: 'ready' | 'downloading' | 'queued';
-  estimatedWaitMs?: number;  // If not ready
-  streamUrl?: string;        // If ready
+  estimatedWaitMs?: number;
+  streamUrl?: string;
+  actualStart: number;  // May differ due to keyframe snapping
+  actualEnd: number;
 }
 ```
 
@@ -2340,18 +2240,18 @@ CREATE TABLE admin_audit_log (
 // Request
 {
   sessionId: string;
-  mode: 'rules' | 'cloud' | 'local';
+  mode: 'rules' | 'local';
+  transcriptLanguage: string;
 }
 
 // Response
 {
-  taskId: string;          // For polling status
+  taskId: string;
   status: 'processing' | 'complete';
-  moments?: VisualMoment[];  // If complete
+  moments?: VisualMoment[];
 }
 
 // Errors
-// 401: Cloud mode requires Google connection
 // 403: Local mode requires feature flag
 ```
 
@@ -2362,12 +2262,11 @@ CREATE TABLE admin_audit_log (
 {
   sessionId: string;
   videoId: string;
-  moments: string[];           // Moment IDs to include
-  format: 'markdown' | 'json' | 'plaintext';
+  moments: string[];
+  format: 'markdown' | 'json';
   options: {
-    includeImages: boolean;    // Embed base64 images
+    includeImages: boolean;
     includeTimestampLinks: boolean;
-    imageQuality?: 'low' | 'medium' | 'high';
   };
 }
 
@@ -2375,86 +2274,104 @@ CREATE TABLE admin_audit_log (
 {
   exportId: string;
   status: 'processing' | 'ready';
-  downloadUrl?: string;  // If ready
+  downloadUrl?: string;
 }
 ```
 
-### 12.3 WebSocket Protocol
+### 14.4 WebSocket Protocol
 
-**Connection:** `wss://yourdomain.com/ws/session/{sessionId}`
+**Connection:** `wss://{domain}/ws/session/{sessionId}?lastEventId={optional}`
 
-**Messages (Server -> Client):**
+**Server -> Client Messages:**
 
 ```typescript
+// All messages include eventId for replay support
+interface WSMessage {
+  eventId: string;
+  type: string;
+  // ... type-specific fields
+}
+
 // Segment download progress
 {
-  type: 'segment_progress';
-  segmentId: string;
-  progress: number;  // 0-100
-  status: 'downloading' | 'ready' | 'error';
+  eventId: "evt_abc123",
+  type: "segment_progress",
+  segmentId: string,
+  progress: number,  // 0-100
+  status: "downloading" | "ready" | "error"
 }
 
 // Analysis progress
 {
-  type: 'analysis_progress';
-  videoId: string;
-  stage: 'rules' | 'llm';
-  progress: number;
-  momentsFound: number;
+  eventId: "evt_abc124",
+  type: "analysis_progress",
+  videoId: string,
+  stage: "rules" | "llm",
+  progress: number,
+  momentsFound: number
 }
 
 // New moment detected
 {
-  type: 'moment_detected';
-  moment: VisualMoment;
+  eventId: "evt_abc125",
+  type: "moment_detected",
+  moment: VisualMoment
 }
 
 // Export ready
 {
-  type: 'export_ready';
-  exportId: string;
-  downloadUrl: string;
+  eventId: "evt_abc126",
+  type: "export_ready",
+  exportId: string,
+  downloadUrl: string
 }
 
 // Session warning
 {
-  type: 'session_warning';
-  message: string;  // e.g., "Session expiring in 1 minute"
+  eventId: "evt_abc127",
+  type: "session_warning",
+  message: string  // e.g., "Session expiring in 1 minute"
 }
 ```
 
-**Messages (Client -> Server):**
+**Client -> Server Messages:**
 
 ```typescript
 // Heartbeat (every 30s)
-{
-  type: 'heartbeat';
-}
+{ type: "heartbeat" }
 
 // Acknowledge moment
 {
-  type: 'moment_ack';
-  momentId: string;
-  action: 'confirm' | 'dismiss';
+  type: "moment_ack",
+  momentId: string,
+  action: "confirm" | "dismiss"
 }
 ```
 
 ---
 
-## 13. Export Artifact Format
+## 15. Export Artifact Format
 
-### 13.1 Design for AI Consumption
+### 15.1 Design for AI Consumption
 
 **Decision:** Primary format is **Markdown with base64-embedded images**.
 
 **Why Base64?**
 
 - **Self-contained:** No external dependencies, works offline
-- **LLM-compatible:** Claude, GPT-4V, and Gemini all accept base64 images in API calls
+- **LLM-compatible:** Claude, GPT-4V, and Gemini all accept base64 images
 - **Portable:** Single file, easy to share/archive
 - **No link rot:** External image hosts can go down; base64 is forever
 
-### 13.2 Markdown Format Specification
+**Image Format:**
+
+- **Format:** JPEG (good balance of quality and size)
+- **Quality:** 80% (yields ~50-150KB per frame at 720p)
+- **Resolution:** Native frame resolution from video segment
+
+Note: The 80% quality setting is a starting point. Experimentation may reveal that 70% is sufficient for AI comprehension or that 90% is needed for certain diagram-heavy content. Adjust based on artifact size vs. AI accuracy tradeoffs.
+
+### 15.2 Markdown Format Specification
 
 ```markdown
 # [Video Title]
@@ -2506,7 +2423,7 @@ CREATE TABLE admin_audit_log (
 *Generated by [Tool Name] - AI-consumable transcript with visual context*
 ```
 
-### 13.3 JSON Format (Programmatic Use)
+### 15.3 JSON Format (Programmatic Use)
 
 ```json
 {
@@ -2538,154 +2455,49 @@ CREATE TABLE admin_audit_log (
   "metadata": {
     "extracted_at": "2024-12-14T10:30:00Z",
     "tool_version": "1.0.0",
-    "detection_mode": "cloud"
+    "detection_mode": "rules"
   }
 }
 ```
 
-### 13.4 Plain Text Format (Fallback)
-
-```
-VIDEO: [Title]
-URL: https://youtube.com/watch?v=VIDEO_ID
-DURATION: 45:00
-EXTRACTED: 2024-12-14
-
-DESCRIPTION:
-[Original description]
-
-----------------------------------------
-
-TRANSCRIPT:
-
-[00:00] Welcome to today's tutorial...
-[00:15] As you can see here... [VISUAL: Code editor - see image 1]
-[00:32] The CSS flexbox model...
-[00:45] Let me show you this diagram... [VISUAL: Diagram - see image 2]
-...
-
-----------------------------------------
-
-VISUAL MOMENTS:
-1. 00:15 - Code editor showing HTML structure (code)
-2. 00:45 - Flexbox diagram explaining axis (diagram)
-3. 02:30 - Browser DevTools demonstration (ui)
-
-----------------------------------------
-Generated by [Tool Name]
-```
-
 ---
 
-## 14. Admin Dashboard
+## 16. Admin Dashboard
 
-### 14.1 Access Method
+### 16.1 Access Method
 
-**URL:** `http://<your-tailscale-hostname>:8443/admin` (Tailscale only)
+**URL:** `http://{tailscale-hostname}:8443/admin` (Tailscale only)
 
 No login required -- if you can reach it, you're authorized (Tailscale identity).
 
-### 14.2 Dashboard Sections
+### 16.2 Dashboard Sections
 
-**Overview Page:**
+**Overview:** System health (CPU, RAM, cache usage), active sessions, queue depth.
 
-```
-+-----------------------------------------------------------------------+
-|  ADMIN DASHBOARD                                         [Your TS ID] |
-+-----------------------------------------------------------------------+
-|                                                                       |
-|  System Health                                                        |
-|  +------------------+  +------------------+  +------------------+     |
-|  |  CPU: 23%        |  |  RAM: 1.8/8 GB   |  |  Cache: 4.2 GB   |     |
-|  |  ####......      |  |  ######....      |  |  ########..      |     |
-|  +------------------+  +------------------+  +------------------+     |
-|                                                                       |
-|  Active Sessions: 3     Queue Depth: 2      Gemini Calls Today: 47    |
-|                                                                       |
-+-----------------------------------------------------------------------+
-|                                                                       |
-|  Recent Activity                                                      |
-|  -----------------------------------------------------------------    |
-|  * 2 min ago   user_abc    Extracted video (tutorial, 12 moments)     |
-|  * 5 min ago   anon_xyz    Exported artifact (rules only)             |
-|  * 12 min ago  user_abc    Connected Google account                   |
-|                                                                       |
-+-----------------------------------------------------------------------+
-```
+**User Management:** List users, view usage stats, toggle feature flags.
 
-**User Management Page:**
+**Cache Management:** View cache size breakdown, clear unlocked segments.
+
+**Admin Capabilities:**
 
 ```
-+-----------------------------------------------------------------------+
-|  Users                                          [Search] [Export CSV] |
-+-----------------------------------------------------------------------+
-|                                                                       |
-|  ID         | Type       | Google | Local LLM | Videos | Last Active  |
-|  -----------+------------+--------+-----------+--------+--------------+
-|  user_abc   | Identified | [x]    | [x]       | 23     | 2 min ago    |
-|  user_def   | Identified | [x]    | [ ]       | 8      | 1 hour ago   |
-|  anon_xyz   | Anonymous  | [ ]    | [ ]       | 2      | 5 min ago    |
-|                                                                       |
-|  [Click row for details / feature management]                         |
-|                                                                       |
-+-----------------------------------------------------------------------+
-```
-
-**User Detail / Feature Flags Page:**
-
-```
-+-----------------------------------------------------------------------+
-|  User: user_abc                                             [<- Back] |
-+-----------------------------------------------------------------------+
-|                                                                       |
-|  Account Details                                                      |
-|  -----------------------------------------------------------------    |
-|  Created: 2024-12-01                                                  |
-|  Email: user@example.com (via Hanko)                                  |
-|  Google: Connected (gemini scope)                                     |
-|                                                                       |
-|  Feature Flags                                                        |
-|  -----------------------------------------------------------------    |
-|                                                                       |
-|  Local LLM Access     [=========] ON                                  |
-|                       Granted: 2024-12-10                             |
-|                                                                       |
-|  Rate Limit Override  [.........] OFF                                 |
-|                       Default limits apply                            |
-|                                                                       |
-|  [Save Changes]                                                       |
-|                                                                       |
-+-----------------------------------------------------------------------+
-```
-
-**Cache Management Page:**
-
-```
-+-----------------------------------------------------------------------+
-|  Cache Status                                                         |
-+-----------------------------------------------------------------------+
-|                                                                       |
-|  Total Size: 4.2 GB / 10 GB                                           |
-|  ####################....................                             |
-|                                                                       |
-|  Segments: 234 files (3.8 GB)                                         |
-|  Frames: 1,203 files (0.3 GB)                                         |
-|  Metadata: 89 files (0.1 GB)                                          |
-|                                                                       |
-|  Currently Locked: 12 segments (3 sessions)                           |
-|                                                                       |
-|  [Clear Unlocked Segments]  [Clear All Frames]  [Clear Everything]    |
-|                                                                       |
-+-----------------------------------------------------------------------+
++------------------------+------------------------------------------+
+| Capability             | Description                              |
++------------------------+------------------------------------------+
+| User Management        | View all users, usage stats              |
+| Feature Flags          | Toggle local LLM per user                |
+| Rate Limit Override    | Adjust multiplier for specific users     |
+| Cache Management       | View/clear cache, see stats              |
+| System Health          | Resource usage, queue depth              |
++------------------------+------------------------------------------+
 ```
 
 ---
 
-## 15. Visual Polish & Cool Factor
+## 17. Visual Polish & Cool Factor
 
-### 15.1 Framework Stack
+### 17.1 Framework Stack
 
-**Building blocks:**
 ```
 shadcn/ui (foundation)
         |
@@ -2693,31 +2505,27 @@ shadcn/ui (foundation)
 Framer Motion (micro-interactions)
         |
         v
-Aceternity UI / Magic UI (hero effects)
-        |
-        v
-React Three Fiber (background shaders) -- optional
+Aceternity UI / Magic UI (hero effects) -- selective use
 ```
 
-**Component strategy:**
+**Component Strategy:**
+
 ```
-+----------------------------------+------------------------+-----------------------------+
-| Component Need                   | Solution               | Source                      |
-+----------------------------------+------------------------+-----------------------------+
-| Forms, buttons, dialogs, inputs  | shadcn/ui              | Standard, accessible        |
-| Transcript list (virtual scroll) | shadcn + custom        | @tanstack/react-virtual     |
-| Video segment player             | Custom build           | No OOTB option              |
-| Timeline with segment indicators | Custom build           | Unique requirement          |
-| Frame review gallery             | shadcn/ui + Framer     | Lightbox with gestures      |
-| Loading states, skeletons        | shadcn/ui              | Standard                    |
-| Toasts, notifications            | sonner                 | shadcn default              |
-| Hero animations                  | Aceternity UI          | Pre-built wow effects       |
-| Micro-interactions               | Framer Motion          | Entrance/exit animations    |
-| Background effects               | Three.js or CSS        | Optional shader             |
-+----------------------------------+------------------------+-----------------------------+
++----------------------------------+------------------------+
+| Component Need                   | Solution               |
++----------------------------------+------------------------+
+| Forms, buttons, dialogs, inputs  | shadcn/ui              |
+| Transcript list (virtual scroll) | @tanstack/react-virtual|
+| Video segment player             | Custom build           |
+| Timeline with segment indicators | Custom build           |
+| Frame review gallery             | shadcn/ui + Framer     |
+| Loading states, skeletons        | shadcn/ui              |
+| Toasts, notifications            | sonner                 |
+| Micro-interactions               | Framer Motion          |
++----------------------------------+------------------------+
 ```
 
-### 15.2 Key "Wow" Moments
+### 17.2 Key "Wow" Moments
 
 ```
 +--------------------+--------------------------------+------------------+
@@ -2729,25 +2537,10 @@ React Three Fiber (background shaders) -- optional
 | Moment confirmation| Particle burst + pulse         | Framer + Custom  |
 | Frame gallery      | Masonry + physics drag         | Framer Reorder   |
 | Export ready       | Confetti + button materialize  | Custom           |
-| Background         | Subtle gradient shift          | CSS or Three.js  |
 +--------------------+--------------------------------+------------------+
 ```
 
-### 15.3 Mobile-Specific Polish
-
-```
-+--------------------+--------------------+-----------------------------+
-| Interaction        | Desktop            | Mobile                      |
-+--------------------+--------------------+-----------------------------+
-| Moment select      | Click + hover glow | Long-press + haptic + ripple|
-| Delete             | Small x button     | Swipe left + red reveal     |
-| Reorder            | Drag handle        | Drag with lift shadow       |
-| Settings           | Dropdown           | Bottom sheet slide-up       |
-| Loading            | Spinner            | Skeleton shimmer            |
-+--------------------+--------------------+-----------------------------+
-```
-
-### 15.4 Performance Budget
+### 17.3 Performance Budget
 
 **Golden Rule:** One "hero" effect per view. Don't stack multiple expensive animations.
 
@@ -2755,49 +2548,17 @@ React Three Fiber (background shaders) -- optional
 +----------------------+------------------+---------------------------------+
 | Effect               | Performance Cost | Mitigation                      |
 +----------------------+------------------+---------------------------------+
-| Three.js background  | Medium (GPU)     | Simple shader, pause when hidden|
 | Framer Motion        | Low              | Use layout prop wisely          |
 | Aceternity effects   | Varies           | Pick lightweight ones           |
 | Particle effects     | Medium-High      | Limit count, use CSS if possible|
-| Lottie               | Low              | Pre-optimized vectors           |
 +----------------------+------------------+---------------------------------+
-```
-
-### 15.5 `shadcn` Extensibility Assessment
-
-**Strengths:**
-- Headless architecture (you own the code, not node_modules)
-- Tailwind-based, easy to modify
-- Accessible by default (Radix primitives)
-- Great starting point for custom components
-
-**Gaps for This Project:**
-- No video player component (expected—this is specialized)
-- No timeline/range-with-markers component (we'll build it)
-- No virtualized list (use @tanstack/react-virtual)
-
-**Verdict:** shadcn is the right foundation. The gaps are specific to our unique features and would exist with any general-purpose UI library.
-
-
-### 15.6 Cool Libraries
-```
-+--------------------+---------------------------------------------+--------------------------------+
-| Library            | What It Does                                | Use Case in Our App            |
-+--------------------+---------------------------------------------+--------------------------------+
-| Aceternity UI      | Animated components (cards, backgrounds)    | Hero section, card hovers      |
-| Magic UI           | Animated gradients, text shimmer, borders   | Text effects, borders          |
-| Framer Motion      | Production animation library                | Transitions, reordering        |
-| React Three Fiber  | React renderer for Three.js                 | Background shader (optional)   |
-| Lottie             | After Effects animations in web             | Success/error state animations |
-| GSAP               | Professional animation (complex timelines)  | Scroll-triggered sequences     |
-+--------------------+---------------------------------------------+--------------------------------+
 ```
 
 ---
 
-## 16. Deployment Architecture
+## 18. Deployment Architecture
 
-### 16.1 Process Layout
+### 18.1 Process Layout
 
 ```
 +----------------------------------------------------------------------+
@@ -2817,7 +2578,6 @@ React Three Fiber (background shaders) -- optional
 |  +-------------+      +-------------+      +-------------+           |
 |  |  Next.js    |      |  FastAPI    |      |  Hanko      |           |
 |  |  :3000      |      |  :8000      |      |  :8001      |           |
-|  |  (2 workers)|      |  (2 workers)|      |  (1 worker) |           |
 |  +-------------+      +-------------+      +-------------+           |
 |                              |                                       |
 |              +---------------+---------------+                       |
@@ -2825,7 +2585,7 @@ React Three Fiber (background shaders) -- optional
 |       +-------------+                 +-------------+                |
 |       |  Huey       |                 |  Ollama     |                |
 |       |  Worker     |                 |  :11434     |                |
-|       |  (1 process)|                 |  (on-demand)|                |
+|       |  (1 thread) |                 |  (on-demand)|                |
 |       +-------------+                 +-------------+                |
 |                                                                      |
 |  +----------------------------------------------------------------+  |
@@ -2838,92 +2598,21 @@ React Three Fiber (background shaders) -- optional
 |                                                                      |
 |  +----------------------------------------------------------------+  |
 |  |  PostgreSQL (for Hanko only)                                   |  |
-|  |  /var/lib/postgresql/data                                      |  |
 |  +----------------------------------------------------------------+  |
 |                                                                      |
 +----------------------------------------------------------------------+
 ```
 
-### 16.2 systemd Service Units
-
-**FastAPI Service:**
-
-```ini
-# /etc/systemd/system/yttool-api.service
-[Unit]
-Description=YouTube Tool API
-After=network.target
-
-[Service]
-Type=simple
-User=yttool
-WorkingDirectory=/opt/yttool
-Environment=PATH=/opt/yttool/venv/bin
-ExecStart=/opt/yttool/venv/bin/uvicorn app.main:app \
-    --host 127.0.0.1 \
-    --port 8000 \
-    --workers 2
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**Huey Worker Service:**
-
-```ini
-# /etc/systemd/system/yttool-worker.service
-[Unit]
-Description=YouTube Tool Background Worker
-After=network.target
-
-[Service]
-Type=simple
-User=yttool
-WorkingDirectory=/opt/yttool
-Environment=PATH=/opt/yttool/venv/bin
-ExecStart=/opt/yttool/venv/bin/huey_consumer app.tasks.huey \
-    --workers 2 \
-    --worker-type thread
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**Next.js Service:**
-
-```ini
-# /etc/systemd/system/yttool-frontend.service
-[Unit]
-Description=YouTube Tool Frontend
-After=network.target
-
-[Service]
-Type=simple
-User=yttool
-WorkingDirectory=/opt/yttool/frontend
-ExecStart=/usr/bin/node server.js
-Environment=PORT=3000
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
 ---
 
-## 17. Implementation Phases
+## 19. Implementation Phases
 
 ### Phase 1: Foundation (Week 1-2)
 
 - [ ] FastAPI + SQLite setup
-- [ ] yt-dlp transcript extraction
+- [ ] yt-dlp transcript extraction with language selection
 - [ ] Segment download with quality selection
-- [ ] Basic cache manager (no locking yet)
+- [ ] Basic cache manager (with lock persistence)
 - [ ] CLI for testing
 
 **Deliverable:** `python cli.py "youtube-url"` outputs transcript JSON
@@ -2933,10 +2622,10 @@ WantedBy=multi-user.target
 - [ ] Hanko self-hosted deployment
 - [ ] Hanko frontend components integration
 - [ ] Anonymous session system
-- [ ] Session upgrade flow (anon -> identified)
+- [ ] Session lifecycle (heartbeat, timeout, upgrade)
 - [ ] Tailscale admin route protection via Caddy
 
-**Deliverable:** Users can sign up with passkey or Google, sessions persist
+**Deliverable:** Users can sign up with passkey or email, sessions persist
 
 ### Phase 3: Frontend Foundation (Week 3-4)
 
@@ -2952,9 +2641,9 @@ WantedBy=multi-user.target
 
 - [ ] Custom segment player component
 - [ ] Timeline with segment visualization
-- [ ] Session locking for cache
 - [ ] Manual moment selection
 - [ ] Touch-friendly interactions
+- [ ] WebSocket for real-time updates
 
 **Deliverable:** Working video preview with segment-based playback and moment selection
 
@@ -2971,27 +2660,27 @@ WantedBy=multi-user.target
 ### Phase 6: Detection Engine (Week 6-7)
 
 - [ ] Rule-based detection (all patterns)
-- [ ] Google OAuth for Gemini scopes
-- [ ] Gemini API integration
-- [ ] Usage tracking + display
-- [ ] Result merging + deduplication
-
-**Deliverable:** Auto-suggested moments from rules and/or Gemini
-
-### Phase 7: Local LLM + Admin (Week 7-8)
-
 - [ ] Ollama setup with Qwen2.5-1.5B
-- [ ] Feature flag system in database
-- [ ] Admin dashboard (Tailscale-only)
-- [ ] User management UI
-- [ ] Process limiter integration
+- [ ] Feature flag system
+- [ ] Result merging + deduplication
+- [ ] Mode switching UI
 
-**Deliverable:** Admin can grant local LLM access to specific users
+**Deliverable:** Auto-suggested moments from rules and/or local LLM
+
+### Phase 7: Admin Dashboard (Week 7-8)
+
+- [ ] Admin UI (Tailscale-only)
+- [ ] User management
+- [ ] Feature flag controls
+- [ ] Cache management
+- [ ] Rate limit configuration
+
+**Deliverable:** Admin can manage users and grant local LLM access
 
 ### Phase 8: Export + Final Polish (Week 8-9)
 
 - [ ] Markdown artifact generation with base64 images
-- [ ] JSON and plaintext export options
+- [ ] JSON export option
 - [ ] Export download flow
 - [ ] Image upload to external host (optional path)
 - [ ] Cool factor effects (hero, transitions, etc.)
@@ -3010,7 +2699,7 @@ WantedBy=multi-user.target
 
 ---
 
-## 18. Risk Assessment
+## 20. Risk Assessment
 
 ```
 +---------------------------------+------------+--------+---------------------------+
@@ -3020,10 +2709,10 @@ WantedBy=multi-user.target
 |                                 |            |        | to Invidious API          |
 +---------------------------------+------------+--------+---------------------------+
 | KVM 4 runs out of RAM           | Medium     | Medium | Strict limits; swap file  |
-|                                 |            |        | as safety net             |
+|                                 |            |        | as safety net; LLM gated  |
 +---------------------------------+------------+--------+---------------------------+
-| LLM quality insufficient        | Low        | Medium | Cloud API fallback; prompt|
-|                                 |            |        | iteration                 |
+| LLM quality insufficient        | Low        | Medium | Good prompts; rules as    |
+|                                 |            |        | primary tier              |
 +---------------------------------+------------+--------+---------------------------+
 | Cache fills during high use     | Medium     | Low    | Aggressive eviction;      |
 |                                 |            |        | session limits            |
@@ -3037,27 +2726,24 @@ WantedBy=multi-user.target
 | Hanko upgrade breaks things     | Low        | Medium | Pin version; test upgrades|
 |                                 |            |        | in staging                |
 +---------------------------------+------------+--------+---------------------------+
-| Google OAuth scope changes      | Low        | High   | Monitor API announcements;|
-|                                 |            |        | graceful degradation      |
-+---------------------------------+------------+--------+---------------------------+
 ```
 
 ---
 
-## 19. Open Questions
+## 21. Open Questions
 
 1. **Branding:** What should this tool be called?
 2. **Domain:** What domain will this run on?
 3. **Monetization:** Future consideration for premium features?
-4. **Multi-language:** Priority for non-English transcripts?
+4. **Multi-language:** Priority for non-English transcript improvements?
 5. **Collaboration:** Multiple users working on same video?
 6. **Public gallery:** Should finished artifacts be shareable publicly?
 
 ---
 
-## 20. Appendix: Dependencies
+## Appendix A: Dependencies
 
-### 20.1 Backend (Python)
+### A.1 Backend (Python)
 
 ```
 # requirements.txt
@@ -3073,15 +2759,12 @@ python-multipart>=0.0.6
 websockets>=12.0
 aiosqlite>=0.19.0
 python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
-google-generativeai>=0.3.0
-google-auth>=2.25.0
-google-auth-oauthlib>=1.2.0
+cryptography>=42.0.0
 python-dotenv>=1.0.0
 structlog>=24.1.0
 ```
 
-### 20.2 Frontend (Node)
+### A.2 Frontend (Node)
 
 ```json
 {
@@ -3114,7 +2797,7 @@ structlog>=24.1.0
 }
 ```
 
-### 20.3 System Packages
+### A.3 System Packages
 
 ```bash
 # Ubuntu 24.04
@@ -3132,13 +2815,12 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama pull qwen2.5:1.5b-instruct-q4_K_M
 ```
 
-### 20.4 External Services
+### A.4 External Services
 
 ```
 +-------------------+---------------------------+---------------------------+
 | Service           | Purpose                   | Account Required          |
 +-------------------+---------------------------+---------------------------+
-| Google Cloud      | OAuth + Gemini API        | Yes (for OAuth setup)     |
 | imgbb             | Image hosting             | Optional (API key)        |
 | Tailscale         | Admin network access      | Yes (your account)        |
 | SMTP Provider     | Hanko magic links         | Yes (any provider)        |
@@ -3147,7 +2829,71 @@ ollama pull qwen2.5:1.5b-instruct-q4_K_M
 
 ---
 
-## 21. Revision History
+## Appendix B: Environment Variables
+
+All environment variables required for deployment:
+
+```bash
+# =============================================================================
+# DOMAIN & NETWORKING
+# =============================================================================
+DOMAIN=yourdomain.com                    # Public domain for the application
+TAILSCALE_HOSTNAME=your-machine          # Tailscale hostname for admin access
+
+# =============================================================================
+# HANKO AUTHENTICATION
+# =============================================================================
+HANKO_SECRET_KEY=<generate-secure-key>   # openssl rand -hex 32
+POSTGRES_PASSWORD=<generate-secure-pw>   # For Hanko's PostgreSQL
+
+# =============================================================================
+# EMAIL (for Hanko magic links)
+# =============================================================================
+SMTP_HOST=smtp.yourprovider.com
+SMTP_PORT=587
+SMTP_USER=your-smtp-username
+SMTP_PASSWORD=your-smtp-password
+
+# =============================================================================
+# ENCRYPTION (for sensitive data in SQLite)
+# =============================================================================
+# Used by cryptography.fernet for encrypting tokens at rest
+FERNET_KEY=<generate-fernet-key>         # python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+# =============================================================================
+# OPTIONAL: IMAGE HOSTING
+# =============================================================================
+IMGBB_API_KEY=<your-imgbb-key>           # Optional, for external image uploads
+
+# =============================================================================
+# TUNING (all have sensible defaults)
+# =============================================================================
+HUEY_WORKERS=1                           # Background task workers
+CACHE_MAX_SIZE_GB=10                     # Video cache ceiling
+OLLAMA_KEEP_ALIVE=2m                     # How long to keep model in memory
+```
+
+**Token Encryption Implementation:**
+
+```python
+from cryptography.fernet import Fernet
+import os
+
+# Initialize once at startup
+_fernet = Fernet(os.environ["FERNET_KEY"].encode())
+
+def encrypt_token(plaintext: str) -> str:
+    """Encrypt sensitive data before storing in SQLite."""
+    return _fernet.encrypt(plaintext.encode()).decode()
+
+def decrypt_token(ciphertext: str) -> str:
+    """Decrypt sensitive data retrieved from SQLite."""
+    return _fernet.decrypt(ciphertext.encode()).decode()
+```
+
+---
+
+## Revision History
 
 ```
 +---------+------------+--------------------------------------------------------+
@@ -3158,17 +2904,19 @@ ollama pull qwen2.5:1.5b-instruct-q4_K_M
 | 2.0     | 2024-12-14 | Added: Auth architecture, mobile UX, 3-tier LLM,       |
 |         |            | Tailscale admin, elevated Moments Universe             |
 +---------+------------+--------------------------------------------------------+
-| 3.0     | 2024-12-14 | Finalized: Locked Hanko, removed Passage, detailed     |
-|         |            | Google OAuth flows, ASCII-safe diagrams, restored      |
-|         |            | cache/process/data model sections from v1, added       |
-|         |            | systemd configs, expanded API spec, added dependencies |
+| 3.0     | 2024-12-14 | Finalized: Locked Hanko, detailed flows, ASCII         |
+|         |            | diagrams, cache/process/data model sections            |
 +---------+------------+--------------------------------------------------------+
-| 3.1     | 2024-12-14 | Not really finalized. Opus got straight ass after the  |
-|         |            | second iteration or so, added stuff that's completely  |
-|         |            | irrelevant (systemd resource files) and just got lazy  |
-|         |            | about others (details lost between v1 and v2).         |
-|         |            |                                                        |
-|         |            |                                                        |
+| 4.0     | 2024-12-15 | Major revision: Removed cloud LLM (Gemini) tier due    |
+|         |            | to OAuth architecture incompatibility. Consolidated    |
+|         |            | session management and rate limiting into dedicated    |
+|         |            | sections. Added memory budget analysis. Fixed cache    |
+|         |            | lock persistence (now survives restarts). Added        |
+|         |            | transcript language selection. Added WebSocket         |
+|         |            | reconnection with event replay. Added CORS config.     |
+|         |            | Added environment variables appendix. Removed          |
+|         |            | unnecessary systemd configs and plaintext export.      |
+|         |            | Clarified segment download precision and fallback.     |
 +---------+------------+--------------------------------------------------------+
 ```
 
